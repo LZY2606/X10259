@@ -9,6 +9,16 @@ import (
 type bucket[T any] struct {
 	sync.RWMutex
 	lookup map[string]*Item[T]
+	now    func() time.Time
+}
+
+// nowTime returns the current time from the cache's configured clock,
+// falling back to the system clock for buckets built outside of a cache.
+func (b *bucket[T]) nowTime() time.Time {
+	if b.now == nil {
+		return time.Now()
+	}
+	return b.now()
 }
 
 func (b *bucket[T]) itemCount() int {
@@ -43,8 +53,9 @@ func (b *bucket[T]) setnx(key string, value T, duration time.Duration, track boo
 		return item
 	}
 
-	expires := time.Now().Add(duration).UnixNano()
+	expires := b.nowTime().Add(duration).UnixNano()
 	newItem := newItem(key, value, expires, track)
+	newItem.now = b.now
 
 	b.Lock()
 	defer b.Unlock()
@@ -76,16 +87,18 @@ func (b *bucket[T]) setnx2(key string, f func() T, duration time.Duration, track
 		return item, true
 	}
 
-	expires := time.Now().Add(duration).UnixNano()
+	expires := b.nowTime().Add(duration).UnixNano()
 	newItem := newItem(key, f(), expires, track)
+	newItem.now = b.now
 
 	b.lookup[key] = newItem
 	return newItem, false
 }
 
 func (b *bucket[T]) set(key string, value T, duration time.Duration, track bool) (*Item[T], *Item[T]) {
-	expires := time.Now().Add(duration).UnixNano()
+	expires := b.nowTime().Add(duration).UnixNano()
 	item := newItem(key, value, expires, track)
+	item.now = b.now
 	b.Lock()
 	existing := b.lookup[key]
 	b.lookup[key] = item
@@ -155,7 +168,7 @@ func (b *bucket[T]) deletePrefix(prefix string, deletables chan *Item[T]) int {
 // we expect the caller to have acquired a write lock
 func (b *bucket[T]) clear() {
 	for _, item := range b.lookup {
-		item.promotions = -2
+		item.markDeleted()
 	}
 	b.lookup = make(map[string]*Item[T])
 }

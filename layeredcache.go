@@ -46,6 +46,7 @@ func Layered[T any](config *Configuration[T]) *LayeredCache[T] {
 	for i := 0; i < config.buckets; i++ {
 		c.buckets[i] = &layeredBucket[T]{
 			buckets: make(map[string]*bucket[T]),
+			now:     config.clock,
 		}
 	}
 	go c.worker()
@@ -69,7 +70,7 @@ func (c *LayeredCache[T]) Get(primary, secondary string) *Item[T] {
 	if item == nil {
 		return nil
 	}
-	if item.expires > time.Now().UnixNano() {
+	if item.expires > c.nowTime().UnixNano() {
 		select {
 		case c.promotables <- item:
 		default:
@@ -97,7 +98,7 @@ func (c *LayeredCache[T]) GetOrCreateSecondaryCache(primary string) *SecondaryCa
 	bkt := primaryBkt.getSecondaryBucket(primary)
 	primaryBkt.Lock()
 	if bkt == nil {
-		bkt = &bucket[T]{lookup: make(map[string]*Item[T])}
+		bkt = &bucket[T]{lookup: make(map[string]*Item[T]), now: c.clock}
 		primaryBkt.buckets[primary] = bkt
 	}
 	primaryBkt.Unlock()
@@ -293,25 +294,17 @@ drain:
 }
 
 func (c *LayeredCache[T]) doDelete(item *Item[T]) {
-	if !item.inList {
-		item.promotions = -2
-	} else {
-		c.size -= item.size
-		if c.onDelete != nil {
-			c.onDelete(item)
-		}
-		c.list.Remove(item)
-		item.promotions = -2
-	}
+	c.retire(item)
 }
 
 func (c *LayeredCache[T]) doPromote(item *Item[T]) bool {
-	// deleted before it ever got promoted
-	if item.promotions == -2 {
+	// A deleted item is terminal: it must never be resurrected by a late
+	// promotion, even if it has since expired or been re-set.
+	if item.State() == StateDeleted {
 		return false
 	}
 
-	if item.inList {
+	if item.State() == StateListed {
 		if item.shouldPromote(c.getsPerPromote) {
 			c.list.MoveToFront(item)
 			item.promotions = 0
@@ -321,7 +314,25 @@ func (c *LayeredCache[T]) doPromote(item *Item[T]) bool {
 
 	c.size += item.size
 	c.list.Insert(item)
+	item.markListed()
 	return true
+}
+
+// retire performs the terminal transition of an item into StateDeleted,
+// running the exit actions (size accounting, list removal, onDelete
+// callback) exactly once. This is the single place where ownership of an
+// item is released, which guarantees the onDelete callback fires at most
+// once per item and never while holding a bucket lock, so callbacks may
+// safely re-enter the cache.
+func (c *LayeredCache[T]) retire(item *Item[T]) {
+	if item.markDeleted() != StateListed {
+		return
+	}
+	c.size -= item.size
+	c.list.Remove(item)
+	if c.onDelete != nil {
+		c.onDelete(item)
+	}
 }
 
 func (c *LayeredCache[T]) gc() int {
@@ -339,16 +350,9 @@ func (c *LayeredCache[T]) gc() int {
 		if !c.tracking || atomic.LoadInt32(&item.refCount) == 0 {
 
 			c.bucket(item.group).delete(item.group, item.key)
-			itemSize := item.size
-			c.size -= itemSize
-			prunedSize += itemSize
-
-			c.list.Remove(item)
-			if c.onDelete != nil {
-				c.onDelete(item)
-			}
+			prunedSize += item.size
+			c.retire(item)
 			dropped += 1
-			item.promotions = -2
 		}
 		item = prev
 	}

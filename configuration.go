@@ -1,5 +1,7 @@
 package ccache
 
+import "time"
+
 type Configuration[T any] struct {
 	maxSize        int64
 	buckets        int
@@ -8,6 +10,7 @@ type Configuration[T any] struct {
 	promoteBuffer  int
 	getsPerPromote int32
 	tracking       bool
+	clock          func() time.Time
 	onDelete       func(item *Item[T])
 }
 
@@ -23,7 +26,29 @@ func Configure[T any]() *Configuration[T] {
 		promoteBuffer:  1024,
 		maxSize:        5000,
 		tracking:       false,
+		clock:          time.Now,
 	}
+}
+
+// Clock sets the time source used to compute and evaluate item expiration.
+// It defaults to time.Now. Supplying a deterministic clock is primarily
+// useful for tests; the configured clock is used by the exact same
+// production code paths (Set, Get, Extend, Expired, TTL), so behavior is
+// identical and only the source of "now" differs.
+func (c *Configuration[T]) Clock(now func() time.Time) *Configuration[T] {
+	if now == nil {
+		now = time.Now
+	}
+	c.clock = now
+	return c
+}
+
+// nowTime returns the current time from the configured clock.
+func (c *Configuration[T]) nowTime() time.Time {
+	if c.clock == nil {
+		return time.Now()
+	}
+	return c.clock()
 }
 
 // The max size for the cache

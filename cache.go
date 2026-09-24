@@ -3,6 +3,7 @@ package ccache
 
 import (
 	"hash/fnv"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -17,6 +18,16 @@ type Cache[T any] struct {
 	bucketMask      uint32
 	deletables      chan *Item[T]
 	promotables     chan *Item[T]
+	fetchMu         sync.Mutex
+	inflight        map[string]*fetchCall[T]
+}
+
+// fetchCall tracks an in-flight Fetch so that concurrent callers for the
+// same key share a single execution of the fetch function (single-flight).
+type fetchCall[T any] struct {
+	done chan struct{}
+	item *Item[T]
+	err  error
 }
 
 // Create a new cache with the specified configuration
@@ -35,6 +46,7 @@ func New[T any](config *Configuration[T]) *Cache[T] {
 	for i := 0; i < config.buckets; i++ {
 		c.buckets[i] = &bucket[T]{
 			lookup: make(map[string]*Item[T]),
+			now:    config.clock,
 		}
 	}
 	go c.worker()
@@ -169,19 +181,42 @@ func (c *Cache[T]) Extend(key string, duration time.Duration) bool {
 // Attempts to get the value from the cache and calles fetch on a miss (missing
 // or stale item). If fetch returns an error, no value is cached and the error
 // is returned back to the caller.
-// Note that Fetch merely calls the public Get and Set functions. If you want
-// a different Fetch behavior, such as thundering herd protection or returning
-// expired items, implement it in your application.
+// Concurrent Fetch calls for the same key are single-flight: the fetch
+// function executes at most once and every caller observes that same result
+// (value or error). The fetch function is invoked without holding any cache
+// lock, so it is free to re-enter the cache.
 func (c *Cache[T]) Fetch(key string, duration time.Duration, fetch func() (T, error)) (*Item[T], error) {
 	item := c.Get(key)
 	if item != nil && !item.Expired() {
 		return item, nil
 	}
-	value, err := fetch()
-	if err != nil {
-		return nil, err
+
+	c.fetchMu.Lock()
+	if c.inflight == nil {
+		c.inflight = make(map[string]*fetchCall[T])
 	}
-	return c.set(key, value, duration, false), nil
+	if call, ok := c.inflight[key]; ok {
+		c.fetchMu.Unlock()
+		<-call.done
+		return call.item, call.err
+	}
+	call := &fetchCall[T]{done: make(chan struct{})}
+	c.inflight[key] = call
+	c.fetchMu.Unlock()
+
+	value, err := fetch()
+	if err == nil {
+		call.item = c.set(key, value, duration, false)
+	} else {
+		call.err = err
+	}
+
+	c.fetchMu.Lock()
+	delete(c.inflight, key)
+	c.fetchMu.Unlock()
+	close(call.done)
+
+	return call.item, call.err
 }
 
 // Remove the item from the cache, return true if the item was present, false otherwise.
@@ -331,25 +366,17 @@ doAllDeletes:
 }
 
 func (c *Cache[T]) doDelete(item *Item[T]) {
-	if !item.inList {
-		item.promotions = -2
-	} else {
-		c.size -= item.size
-		if c.onDelete != nil {
-			c.onDelete(item)
-		}
-		c.list.Remove(item)
-		item.promotions = -2
-	}
+	c.retire(item)
 }
 
 func (c *Cache[T]) doPromote(item *Item[T]) bool {
-	// already deleted
-	if item.promotions == -2 {
+	// A deleted item is terminal: it must never be resurrected by a late
+	// promotion, even if it has since expired or been re-set.
+	if item.State() == StateDeleted {
 		return false
 	}
 
-	if item.inList {
+	if item.State() == StateListed {
 		if item.shouldPromote(c.getsPerPromote) {
 			c.list.MoveToFront(item)
 			item.promotions = 0
@@ -359,7 +386,25 @@ func (c *Cache[T]) doPromote(item *Item[T]) bool {
 
 	c.size += item.size
 	c.list.Insert(item)
+	item.markListed()
 	return true
+}
+
+// retire performs the terminal transition of an item into StateDeleted,
+// running the exit actions (size accounting, list removal, onDelete
+// callback) exactly once. This is the single place where ownership of an
+// item is released, which guarantees the onDelete callback fires at most
+// once per item and never while holding a bucket lock, so callbacks may
+// safely re-enter the cache.
+func (c *Cache[T]) retire(item *Item[T]) {
+	if item.markDeleted() != StateListed {
+		return
+	}
+	c.size -= item.size
+	c.list.Remove(item)
+	if c.onDelete != nil {
+		c.onDelete(item)
+	}
 }
 
 func (c *Cache[T]) gc() int {
@@ -376,16 +421,9 @@ func (c *Cache[T]) gc() int {
 		prev := item.prev
 		if !c.tracking || atomic.LoadInt32(&item.refCount) == 0 {
 			c.bucket(item.key).delete(item.key)
-			itemSize := item.size
-			c.size -= itemSize
-			prunedSize += itemSize
-
-			c.list.Remove(item)
-			if c.onDelete != nil {
-				c.onDelete(item)
-			}
+			prunedSize += item.size
+			c.retire(item)
 			dropped += 1
-			item.promotions = -2
 		}
 		item = prev
 	}
