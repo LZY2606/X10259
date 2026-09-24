@@ -17,6 +17,8 @@ type Cache[T any] struct {
 	bucketMask      uint32
 	deletables      chan *Item[T]
 	promotables     chan *Item[T]
+	flights         fetchGroup[string, T]
+	clk             clock
 }
 
 // Create a new cache with the specified configuration
@@ -31,10 +33,12 @@ func New[T any](config *Configuration[T]) *Cache[T] {
 		deletables:      make(chan *Item[T], config.deleteBuffer),
 		promotables:     make(chan *Item[T], config.promoteBuffer),
 		pruneTargetSize: config.maxSize - config.maxSize*int64(config.percentToPrune)/100,
+		clk:             systemClock{},
 	}
 	for i := 0; i < config.buckets; i++ {
 		c.buckets[i] = &bucket[T]{
 			lookup: make(map[string]*Item[T]),
+			clk:    c.clk,
 		}
 	}
 	go c.worker()
@@ -177,7 +181,7 @@ func (c *Cache[T]) Fetch(key string, duration time.Duration, fetch func() (T, er
 	if item != nil && !item.Expired() {
 		return item, nil
 	}
-	value, err := fetch()
+	value, err := c.flights.Do(key, fetch)
 	if err != nil {
 		return nil, err
 	}
@@ -330,36 +334,55 @@ doAllDeletes:
 	}
 }
 
+// doDelete is the single consumer of the deletables queue and one half of the
+// item state machine's "leave the list" transitions (the other is gc). It runs
+// on the worker goroutine without holding any bucket lock, so the onDelete
+// callback may safely call back into the cache.
 func (c *Cache[T]) doDelete(item *Item[T]) {
-	if !item.inList {
-		item.promotions = -2
-	} else {
-		c.size -= item.size
-		if c.onDelete != nil {
-			c.onDelete(item)
+	if item.inList {
+		// A queued delete can reach us after a GC eviction already won the
+		// promoted->deleted transition; the CAS makes that a no-op.
+		if !item.claimPromotedRemoval() {
+			return
 		}
+		c.size -= item.size
 		c.list.Remove(item)
-		item.promotions = -2
+		c.notifyDelete(item)
+		return
 	}
+	// Never made it into the list. Retire it unless an earlier queue message
+	// (overwrite/clear) already did; in that case no callback is owed.
+	item.claimQueuedRemoval()
 }
 
+// doPromote is the "enter / refresh the list" transition. An expired item is
+// rejected even if its promotion is processed late, and a deleted item can
+// never be re-inserted.
 func (c *Cache[T]) doPromote(item *Item[T]) bool {
-	// already deleted
-	if item.promotions == -2 {
+	if item.isDeleted() || item.expiredAt(nowOf(c.clk)) {
 		return false
 	}
 
 	if item.inList {
 		if item.shouldPromote(c.getsPerPromote) {
 			c.list.MoveToFront(item)
-			item.promotions = 0
 		}
 		return false
 	}
 
+	if !item.claimPromote() {
+		return false
+	}
 	c.size += item.size
 	c.list.Insert(item)
 	return true
+}
+
+// notifyDelete fires the user callback outside of every cache lock.
+func (c *Cache[T]) notifyDelete(item *Item[T]) {
+	if c.onDelete != nil {
+		c.onDelete(item)
+	}
 }
 
 func (c *Cache[T]) gc() int {
@@ -374,18 +397,15 @@ func (c *Cache[T]) gc() int {
 			return dropped
 		}
 		prev := item.prev
-		if !c.tracking || atomic.LoadInt32(&item.refCount) == 0 {
+		if (!c.tracking || atomic.LoadInt32(&item.refCount) == 0) && item.claimPromotedRemoval() {
 			c.bucket(item.key).delete(item.key)
 			itemSize := item.size
 			c.size -= itemSize
 			prunedSize += itemSize
 
 			c.list.Remove(item)
-			if c.onDelete != nil {
-				c.onDelete(item)
-			}
+			c.notifyDelete(item)
 			dropped += 1
-			item.promotions = -2
 		}
 		item = prev
 	}

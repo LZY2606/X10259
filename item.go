@@ -30,9 +30,11 @@ type Item[T any] struct {
 	next       *Item[T]
 	prev       *Item[T]
 	inList     bool
+	state      int32
+	clk        clock
 }
 
-func newItem[T any](key string, value T, expires int64, track bool) *Item[T] {
+func newItem[T any](key string, value T, expires int64, track bool, clk clock) *Item[T] {
 	size := int64(1)
 
 	// https://github.com/golang/go/issues/49206
@@ -46,6 +48,8 @@ func newItem[T any](key string, value T, expires int64, track bool) *Item[T] {
 		promotions: 0,
 		size:       size,
 		expires:    expires,
+		state:      stateQueued,
+		clk:        clk,
 	}
 	if track {
 		item.refCount = 1
@@ -75,22 +79,27 @@ func (i *Item[T]) Release() {
 }
 
 func (i *Item[T]) Expired() bool {
-	expires := atomic.LoadInt64(&i.expires)
-	return expires < time.Now().UnixNano()
+	return atomic.LoadInt64(&i.expires) < nowOf(i.clk).UnixNano()
 }
 
 func (i *Item[T]) TTL() time.Duration {
 	expires := atomic.LoadInt64(&i.expires)
-	return time.Nanosecond * time.Duration(expires-time.Now().UnixNano())
+	return time.Nanosecond * time.Duration(expires-nowOf(i.clk).UnixNano())
 }
 
 func (i *Item[T]) Expires() time.Time {
-	expires := atomic.LoadInt64(&i.expires)
-	return time.Unix(0, expires)
+	return time.Unix(0, atomic.LoadInt64(&i.expires))
 }
 
 func (i *Item[T]) Extend(duration time.Duration) {
-	atomic.StoreInt64(&i.expires, time.Now().Add(duration).UnixNano())
+	atomic.StoreInt64(&i.expires, nowOf(i.clk).Add(duration).UnixNano())
+}
+
+// expiredAt is the state-machine view of expiry, used by the worker before it
+// promotes an item: an expired item must never enter the LRU list, no matter
+// how late its queued promotion is processed.
+func (i *Item[T]) expiredAt(now time.Time) bool {
+	return atomic.LoadInt64(&i.expires) < now.UnixNano()
 }
 
 // String returns a string representation of the Item. This includes the default string

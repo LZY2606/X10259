@@ -8,6 +8,7 @@ import (
 type layeredBucket[T any] struct {
 	sync.RWMutex
 	buckets map[string]*bucket[T]
+	clk     clock
 }
 
 func (b *layeredBucket[T]) itemCount() int {
@@ -42,7 +43,7 @@ func (b *layeredBucket[T]) set(primary, secondary string, value T, duration time
 	b.Lock()
 	bkt, exists := b.buckets[primary]
 	if !exists {
-		bkt = &bucket[T]{lookup: make(map[string]*Item[T])}
+		bkt = &bucket[T]{lookup: make(map[string]*Item[T]), clk: b.clk}
 		b.buckets[primary] = bkt
 	}
 	b.Unlock()

@@ -7,6 +7,11 @@ import (
 	"time"
 )
 
+type layeredKey struct {
+	primary   string
+	secondary string
+}
+
 type LayeredCache[T any] struct {
 	*Configuration[T]
 	control
@@ -17,6 +22,8 @@ type LayeredCache[T any] struct {
 	pruneTargetSize int64
 	deletables      chan *Item[T]
 	promotables     chan *Item[T]
+	flights         fetchGroup[layeredKey, T]
+	clk             clock
 }
 
 // Create a new layered cache with the specified configuration.
@@ -42,10 +49,12 @@ func Layered[T any](config *Configuration[T]) *LayeredCache[T] {
 		deletables:      make(chan *Item[T], config.deleteBuffer),
 		promotables:     make(chan *Item[T], config.promoteBuffer),
 		pruneTargetSize: config.maxSize - config.maxSize*int64(config.percentToPrune)/100,
+		clk:             systemClock{},
 	}
 	for i := 0; i < config.buckets; i++ {
 		c.buckets[i] = &layeredBucket[T]{
 			buckets: make(map[string]*bucket[T]),
+			clk:     c.clk,
 		}
 	}
 	go c.worker()
@@ -69,7 +78,7 @@ func (c *LayeredCache[T]) Get(primary, secondary string) *Item[T] {
 	if item == nil {
 		return nil
 	}
-	if item.expires > time.Now().UnixNano() {
+	if !item.Expired() {
 		select {
 		case c.promotables <- item:
 		default:
@@ -148,10 +157,11 @@ func (c *LayeredCache[T]) Replace(primary, secondary string, value T) bool {
 // expired items, implement it in your application.
 func (c *LayeredCache[T]) Fetch(primary, secondary string, duration time.Duration, fetch func() (T, error)) (*Item[T], error) {
 	item := c.Get(primary, secondary)
-	if item != nil {
+	if item != nil && !item.Expired() {
 		return item, nil
 	}
-	value, err := fetch()
+	key := layeredKey{primary, secondary}
+	value, err := c.flights.Do(key, fetch)
 	if err != nil {
 		return nil, err
 	}
@@ -293,32 +303,35 @@ drain:
 }
 
 func (c *LayeredCache[T]) doDelete(item *Item[T]) {
-	if !item.inList {
-		item.promotions = -2
-	} else {
+	if item.inList {
+		if !item.claimPromotedRemoval() {
+			return
+		}
 		c.size -= item.size
+		c.list.Remove(item)
 		if c.onDelete != nil {
 			c.onDelete(item)
 		}
-		c.list.Remove(item)
-		item.promotions = -2
+		return
 	}
+	item.claimQueuedRemoval()
 }
 
 func (c *LayeredCache[T]) doPromote(item *Item[T]) bool {
-	// deleted before it ever got promoted
-	if item.promotions == -2 {
+	if item.isDeleted() || item.expiredAt(nowOf(c.clk)) {
 		return false
 	}
 
 	if item.inList {
 		if item.shouldPromote(c.getsPerPromote) {
 			c.list.MoveToFront(item)
-			item.promotions = 0
 		}
 		return false
 	}
 
+	if !item.claimPromote() {
+		return false
+	}
 	c.size += item.size
 	c.list.Insert(item)
 	return true
@@ -336,8 +349,7 @@ func (c *LayeredCache[T]) gc() int {
 			return dropped
 		}
 		prev := item.prev
-		if !c.tracking || atomic.LoadInt32(&item.refCount) == 0 {
-
+		if (!c.tracking || atomic.LoadInt32(&item.refCount) == 0) && item.claimPromotedRemoval() {
 			c.bucket(item.group).delete(item.group, item.key)
 			itemSize := item.size
 			c.size -= itemSize
@@ -348,7 +360,6 @@ func (c *LayeredCache[T]) gc() int {
 				c.onDelete(item)
 			}
 			dropped += 1
-			item.promotions = -2
 		}
 		item = prev
 	}

@@ -9,6 +9,7 @@ import (
 type bucket[T any] struct {
 	sync.RWMutex
 	lookup map[string]*Item[T]
+	clk    clock
 }
 
 func (b *bucket[T]) itemCount() int {
@@ -43,8 +44,8 @@ func (b *bucket[T]) setnx(key string, value T, duration time.Duration, track boo
 		return item
 	}
 
-	expires := time.Now().Add(duration).UnixNano()
-	newItem := newItem(key, value, expires, track)
+	expires := nowOf(b.clk).Add(duration).UnixNano()
+	newItem := newItem(key, value, expires, track, b.clk)
 
 	b.Lock()
 	defer b.Unlock()
@@ -76,16 +77,16 @@ func (b *bucket[T]) setnx2(key string, f func() T, duration time.Duration, track
 		return item, true
 	}
 
-	expires := time.Now().Add(duration).UnixNano()
-	newItem := newItem(key, f(), expires, track)
+	expires := nowOf(b.clk).Add(duration).UnixNano()
+	newItem := newItem(key, f(), expires, track, b.clk)
 
 	b.lookup[key] = newItem
 	return newItem, false
 }
 
 func (b *bucket[T]) set(key string, value T, duration time.Duration, track bool) (*Item[T], *Item[T]) {
-	expires := time.Now().Add(duration).UnixNano()
-	item := newItem(key, value, expires, track)
+	expires := nowOf(b.clk).Add(duration).UnixNano()
+	item := newItem(key, value, expires, track, b.clk)
 	b.Lock()
 	existing := b.lookup[key]
 	b.lookup[key] = item
@@ -127,22 +128,23 @@ func (b *bucket[T]) deleteFunc(matches func(key string, item *Item[T]) bool, del
 	b.RLock()
 	for key, item := range lookup {
 		if matches(key, item) {
-			deletables <- item
 			items = append(items, item)
+		}
+	}
+	if len(items) > 0 {
+		b.Lock()
+		for _, item := range items {
+			if lookup[item.key] == item {
+				delete(lookup, item.key)
+			}
+		}
+		b.Unlock()
+		for _, item := range items {
+			deletables <- item
 		}
 	}
 	b.RUnlock()
 
-	if len(items) == 0 {
-		// avoid the write lock if we can
-		return 0
-	}
-
-	b.Lock()
-	for _, item := range items {
-		delete(lookup, item.key)
-	}
-	b.Unlock()
 	return len(items)
 }
 
@@ -155,7 +157,7 @@ func (b *bucket[T]) deletePrefix(prefix string, deletables chan *Item[T]) int {
 // we expect the caller to have acquired a write lock
 func (b *bucket[T]) clear() {
 	for _, item := range b.lookup {
-		item.promotions = -2
+		item.markDeleted()
 	}
 	b.lookup = make(map[string]*Item[T])
 }
