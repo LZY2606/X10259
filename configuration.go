@@ -1,5 +1,7 @@
 package ccache
 
+import "time"
+
 type Configuration[T any] struct {
 	maxSize        int64
 	buckets        int
@@ -9,6 +11,13 @@ type Configuration[T any] struct {
 	getsPerPromote int32
 	tracking       bool
 	onDelete       func(item *Item[T])
+	// now is an optional time source. It is unexported and intended for
+	// tests (e.g. a fake clock); production code leaves it nil, in which
+	// case time.Now is used. Every code path that needs the current time
+	// (expiry computation in bucket.set/setnx/setnx2, Item.Expired/TTL/
+	// Extend) goes through this single source, so tests observe exactly
+	// the production logic.
+	now func() time.Time
 }
 
 // Creates a configuration object with sensible defaults

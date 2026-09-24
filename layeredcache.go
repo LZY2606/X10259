@@ -10,6 +10,7 @@ import (
 type LayeredCache[T any] struct {
 	*Configuration[T]
 	control
+	now             func() time.Time
 	list            *List[T]
 	buckets         []*layeredBucket[T]
 	bucketMask      uint32
@@ -33,9 +34,14 @@ type LayeredCache[T any] struct {
 
 // See ccache.Configure() for creating a configuration
 func Layered[T any](config *Configuration[T]) *LayeredCache[T] {
+	now := config.now
+	if now == nil {
+		now = time.Now
+	}
 	c := &LayeredCache[T]{
 		list:            NewList[T](),
 		Configuration:   config,
+		now:             now,
 		control:         newControl(),
 		bucketMask:      uint32(config.buckets) - 1,
 		buckets:         make([]*layeredBucket[T], config.buckets),
@@ -46,6 +52,7 @@ func Layered[T any](config *Configuration[T]) *LayeredCache[T] {
 	for i := 0; i < config.buckets; i++ {
 		c.buckets[i] = &layeredBucket[T]{
 			buckets: make(map[string]*bucket[T]),
+			now:     now,
 		}
 	}
 	go c.worker()
@@ -69,7 +76,7 @@ func (c *LayeredCache[T]) Get(primary, secondary string) *Item[T] {
 	if item == nil {
 		return nil
 	}
-	if item.expires > time.Now().UnixNano() {
+	if !item.Expired() {
 		select {
 		case c.promotables <- item:
 		default:
@@ -97,7 +104,7 @@ func (c *LayeredCache[T]) GetOrCreateSecondaryCache(primary string) *SecondaryCa
 	bkt := primaryBkt.getSecondaryBucket(primary)
 	primaryBkt.Lock()
 	if bkt == nil {
-		bkt = &bucket[T]{lookup: make(map[string]*Item[T])}
+		bkt = &bucket[T]{lookup: make(map[string]*Item[T]), now: c.now}
 		primaryBkt.buckets[primary] = bkt
 	}
 	primaryBkt.Unlock()

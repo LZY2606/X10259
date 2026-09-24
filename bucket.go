@@ -9,6 +9,23 @@ import (
 type bucket[T any] struct {
 	sync.RWMutex
 	lookup map[string]*Item[T]
+	now    func() time.Time
+}
+
+// currentTime returns the bucket's time source (see Configuration.now).
+// Buckets created directly in unit tests have a nil source and fall back
+// to time.Now.
+func (b *bucket[T]) currentTime() time.Time {
+	if b.now != nil {
+		return b.now()
+	}
+	return time.Now()
+}
+
+func (b *bucket[T]) newItem(key string, value T, duration time.Duration, track bool) *Item[T] {
+	item := newItem(key, value, b.currentTime().Add(duration).UnixNano(), track)
+	item.now = b.now
+	return item
 }
 
 func (b *bucket[T]) itemCount() int {
@@ -43,8 +60,7 @@ func (b *bucket[T]) setnx(key string, value T, duration time.Duration, track boo
 		return item
 	}
 
-	expires := time.Now().Add(duration).UnixNano()
-	newItem := newItem(key, value, expires, track)
+	newItem := b.newItem(key, value, duration, track)
 
 	b.Lock()
 	defer b.Unlock()
@@ -76,16 +92,14 @@ func (b *bucket[T]) setnx2(key string, f func() T, duration time.Duration, track
 		return item, true
 	}
 
-	expires := time.Now().Add(duration).UnixNano()
-	newItem := newItem(key, f(), expires, track)
+	newItem := b.newItem(key, f(), duration, track)
 
 	b.lookup[key] = newItem
 	return newItem, false
 }
 
 func (b *bucket[T]) set(key string, value T, duration time.Duration, track bool) (*Item[T], *Item[T]) {
-	expires := time.Now().Add(duration).UnixNano()
-	item := newItem(key, value, expires, track)
+	item := b.newItem(key, value, duration, track)
 	b.Lock()
 	existing := b.lookup[key]
 	b.lookup[key] = item

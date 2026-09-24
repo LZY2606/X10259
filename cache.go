@@ -22,6 +22,10 @@ type Cache[T any] struct {
 // Create a new cache with the specified configuration
 // See ccache.Configure() for creating a configuration
 func New[T any](config *Configuration[T]) *Cache[T] {
+	now := config.now
+	if now == nil {
+		now = time.Now
+	}
 	c := &Cache[T]{
 		list:            NewList[T](),
 		Configuration:   config,
@@ -35,6 +39,7 @@ func New[T any](config *Configuration[T]) *Cache[T] {
 	for i := 0; i < config.buckets; i++ {
 		c.buckets[i] = &bucket[T]{
 			lookup: make(map[string]*Item[T]),
+			now:    now,
 		}
 	}
 	go c.worker()
