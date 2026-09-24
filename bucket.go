@@ -9,6 +9,14 @@ import (
 type bucket[T any] struct {
 	sync.RWMutex
 	lookup map[string]*Item[T]
+	clock  clock
+}
+
+func (b *bucket[T]) timeSource() clock {
+	if b.clock == nil {
+		return systemClock{}
+	}
+	return b.clock
 }
 
 func (b *bucket[T]) itemCount() int {
@@ -43,8 +51,8 @@ func (b *bucket[T]) setnx(key string, value T, duration time.Duration, track boo
 		return item
 	}
 
-	expires := time.Now().Add(duration).UnixNano()
-	newItem := newItem(key, value, expires, track)
+	expires := b.timeSource().now().Add(duration).UnixNano()
+	newItem := newItemWithClock(key, value, expires, track, b.timeSource())
 
 	b.Lock()
 	defer b.Unlock()
@@ -76,16 +84,16 @@ func (b *bucket[T]) setnx2(key string, f func() T, duration time.Duration, track
 		return item, true
 	}
 
-	expires := time.Now().Add(duration).UnixNano()
-	newItem := newItem(key, f(), expires, track)
+	expires := b.timeSource().now().Add(duration).UnixNano()
+	newItem := newItemWithClock(key, f(), expires, track, b.timeSource())
 
 	b.lookup[key] = newItem
 	return newItem, false
 }
 
 func (b *bucket[T]) set(key string, value T, duration time.Duration, track bool) (*Item[T], *Item[T]) {
-	expires := time.Now().Add(duration).UnixNano()
-	item := newItem(key, value, expires, track)
+	expires := b.timeSource().now().Add(duration).UnixNano()
+	item := newItemWithClock(key, value, expires, track, b.timeSource())
 	b.Lock()
 	existing := b.lookup[key]
 	b.lookup[key] = item
@@ -140,7 +148,11 @@ func (b *bucket[T]) deleteFunc(matches func(key string, item *Item[T]) bool, del
 
 	b.Lock()
 	for _, item := range items {
-		delete(lookup, item.key)
+		// only release the item that actually won the lookup slot at delete
+		// time; a concurrent overwrite may have replaced it.
+		if lookup[item.key] == item {
+			delete(lookup, item.key)
+		}
 	}
 	b.Unlock()
 	return len(items)
@@ -155,7 +167,7 @@ func (b *bucket[T]) deletePrefix(prefix string, deletables chan *Item[T]) int {
 // we expect the caller to have acquired a write lock
 func (b *bucket[T]) clear() {
 	for _, item := range b.lookup {
-		item.promotions = -2
+		item.kill()
 	}
 	b.lookup = make(map[string]*Item[T])
 }
