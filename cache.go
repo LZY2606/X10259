@@ -22,6 +22,10 @@ type Cache[T any] struct {
 // Create a new cache with the specified configuration
 // See ccache.Configure() for creating a configuration
 func New[T any](config *Configuration[T]) *Cache[T] {
+	now := config.now
+	if now == nil {
+		now = time.Now
+	}
 	c := &Cache[T]{
 		list:            NewList[T](),
 		Configuration:   config,
@@ -35,6 +39,7 @@ func New[T any](config *Configuration[T]) *Cache[T] {
 	for i := 0; i < config.buckets; i++ {
 		c.buckets[i] = &bucket[T]{
 			lookup: make(map[string]*Item[T]),
+			clock:  now,
 		}
 	}
 	go c.worker()
@@ -331,25 +336,30 @@ doAllDeletes:
 }
 
 func (c *Cache[T]) doDelete(item *Item[T]) {
-	if !item.inList {
-		item.promotions = -2
-	} else {
+	// Winning the transition to stateDeleted makes this goroutine the sole
+	// owner of the item's retirement side effects. If the item was already
+	// retired (by GC, Clear, or an earlier delete), this is a no-op, which
+	// keeps the onDelete callback at-most-once per item.
+	from := item.state()
+	if !item.transition(stateDeleted, from) {
+		return
+	}
+	if from == statePromoted {
 		c.size -= item.size
 		if c.onDelete != nil {
 			c.onDelete(item)
 		}
 		c.list.Remove(item)
-		item.promotions = -2
 	}
 }
 
 func (c *Cache[T]) doPromote(item *Item[T]) bool {
-	// already deleted
-	if item.promotions == -2 {
+	// already retired: a late promotion must never resurrect it
+	if item.state() == stateDeleted {
 		return false
 	}
 
-	if item.inList {
+	if item.state() == statePromoted {
 		if item.shouldPromote(c.getsPerPromote) {
 			c.list.MoveToFront(item)
 			item.promotions = 0
@@ -357,6 +367,9 @@ func (c *Cache[T]) doPromote(item *Item[T]) bool {
 		return false
 	}
 
+	if !item.transition(statePromoted, statePending) {
+		return false
+	}
 	c.size += item.size
 	c.list.Insert(item)
 	return true
@@ -375,6 +388,10 @@ func (c *Cache[T]) gc() int {
 		}
 		prev := item.prev
 		if !c.tracking || atomic.LoadInt32(&item.refCount) == 0 {
+			if !item.transition(stateDeleted, statePromoted) {
+				item = prev
+				continue
+			}
 			c.bucket(item.key).delete(item.key)
 			itemSize := item.size
 			c.size -= itemSize
@@ -385,7 +402,6 @@ func (c *Cache[T]) gc() int {
 				c.onDelete(item)
 			}
 			dropped += 1
-			item.promotions = -2
 		}
 		item = prev
 	}

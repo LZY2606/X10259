@@ -24,12 +24,13 @@ type Item[T any] struct {
 	group      string
 	promotions int32
 	refCount   int32
+	lifecycle  int32
 	expires    int64
 	size       int64
 	value      T
 	next       *Item[T]
 	prev       *Item[T]
-	inList     bool
+	clock      func() time.Time
 }
 
 func newItem[T any](key string, value T, expires int64, track bool) *Item[T] {
@@ -76,12 +77,12 @@ func (i *Item[T]) Release() {
 
 func (i *Item[T]) Expired() bool {
 	expires := atomic.LoadInt64(&i.expires)
-	return expires < time.Now().UnixNano()
+	return expires < i.now().UnixNano()
 }
 
 func (i *Item[T]) TTL() time.Duration {
 	expires := atomic.LoadInt64(&i.expires)
-	return time.Nanosecond * time.Duration(expires-time.Now().UnixNano())
+	return time.Nanosecond * time.Duration(expires-i.now().UnixNano())
 }
 
 func (i *Item[T]) Expires() time.Time {
@@ -90,7 +91,17 @@ func (i *Item[T]) Expires() time.Time {
 }
 
 func (i *Item[T]) Extend(duration time.Duration) {
-	atomic.StoreInt64(&i.expires, time.Now().Add(duration).UnixNano())
+	atomic.StoreInt64(&i.expires, i.now().Add(duration).UnixNano())
+}
+
+// now returns the current time using the cache's clock. Items created through
+// a cache inherit the cache's clock; the nil fallback keeps a bare Item
+// usable on its own.
+func (i *Item[T]) now() time.Time {
+	if i.clock != nil {
+		return i.clock()
+	}
+	return time.Now()
 }
 
 // String returns a string representation of the Item. This includes the default string

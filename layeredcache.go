@@ -17,6 +17,7 @@ type LayeredCache[T any] struct {
 	pruneTargetSize int64
 	deletables      chan *Item[T]
 	promotables     chan *Item[T]
+	now             func() time.Time
 }
 
 // Create a new layered cache with the specified configuration.
@@ -33,6 +34,10 @@ type LayeredCache[T any] struct {
 
 // See ccache.Configure() for creating a configuration
 func Layered[T any](config *Configuration[T]) *LayeredCache[T] {
+	now := config.now
+	if now == nil {
+		now = time.Now
+	}
 	c := &LayeredCache[T]{
 		list:            NewList[T](),
 		Configuration:   config,
@@ -42,10 +47,12 @@ func Layered[T any](config *Configuration[T]) *LayeredCache[T] {
 		deletables:      make(chan *Item[T], config.deleteBuffer),
 		promotables:     make(chan *Item[T], config.promoteBuffer),
 		pruneTargetSize: config.maxSize - config.maxSize*int64(config.percentToPrune)/100,
+		now:             now,
 	}
 	for i := 0; i < config.buckets; i++ {
 		c.buckets[i] = &layeredBucket[T]{
 			buckets: make(map[string]*bucket[T]),
+			clock:   now,
 		}
 	}
 	go c.worker()
@@ -69,7 +76,7 @@ func (c *LayeredCache[T]) Get(primary, secondary string) *Item[T] {
 	if item == nil {
 		return nil
 	}
-	if item.expires > time.Now().UnixNano() {
+	if !item.Expired() {
 		select {
 		case c.promotables <- item:
 		default:
@@ -97,7 +104,7 @@ func (c *LayeredCache[T]) GetOrCreateSecondaryCache(primary string) *SecondaryCa
 	bkt := primaryBkt.getSecondaryBucket(primary)
 	primaryBkt.Lock()
 	if bkt == nil {
-		bkt = &bucket[T]{lookup: make(map[string]*Item[T])}
+		bkt = &bucket[T]{lookup: make(map[string]*Item[T]), clock: c.now}
 		primaryBkt.buckets[primary] = bkt
 	}
 	primaryBkt.Unlock()
@@ -293,25 +300,28 @@ drain:
 }
 
 func (c *LayeredCache[T]) doDelete(item *Item[T]) {
-	if !item.inList {
-		item.promotions = -2
-	} else {
+	// See Cache.doDelete: winning the transition to stateDeleted owns the
+	// retirement side effects and keeps onDelete at-most-once per item.
+	from := item.state()
+	if !item.transition(stateDeleted, from) {
+		return
+	}
+	if from == statePromoted {
 		c.size -= item.size
 		if c.onDelete != nil {
 			c.onDelete(item)
 		}
 		c.list.Remove(item)
-		item.promotions = -2
 	}
 }
 
 func (c *LayeredCache[T]) doPromote(item *Item[T]) bool {
 	// deleted before it ever got promoted
-	if item.promotions == -2 {
+	if item.state() == stateDeleted {
 		return false
 	}
 
-	if item.inList {
+	if item.state() == statePromoted {
 		if item.shouldPromote(c.getsPerPromote) {
 			c.list.MoveToFront(item)
 			item.promotions = 0
@@ -319,6 +329,9 @@ func (c *LayeredCache[T]) doPromote(item *Item[T]) bool {
 		return false
 	}
 
+	if !item.transition(statePromoted, statePending) {
+		return false
+	}
 	c.size += item.size
 	c.list.Insert(item)
 	return true
@@ -337,6 +350,10 @@ func (c *LayeredCache[T]) gc() int {
 		}
 		prev := item.prev
 		if !c.tracking || atomic.LoadInt32(&item.refCount) == 0 {
+			if !item.transition(stateDeleted, statePromoted) {
+				item = prev
+				continue
+			}
 
 			c.bucket(item.group).delete(item.group, item.key)
 			itemSize := item.size
@@ -348,7 +365,6 @@ func (c *LayeredCache[T]) gc() int {
 				c.onDelete(item)
 			}
 			dropped += 1
-			item.promotions = -2
 		}
 		item = prev
 	}

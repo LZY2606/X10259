@@ -1,5 +1,7 @@
 package ccache
 
+import "time"
+
 type Configuration[T any] struct {
 	maxSize        int64
 	buckets        int
@@ -9,6 +11,13 @@ type Configuration[T any] struct {
 	getsPerPromote int32
 	tracking       bool
 	onDelete       func(item *Item[T])
+	// now is an optional clock override. It is unexported on purpose: it
+	// exists so in-package tests can drive expiration deterministically with
+	// a fake clock. It is not a parallel test-only time source — every
+	// expiration decision in the production path (item creation in buckets,
+	// Item.Expired/TTL/Extend, Get's promote check) reads time through this
+	// single clock to keep fake-clock tests on the same code path.
+	now func() time.Time
 }
 
 // Creates a configuration object with sensible defaults
