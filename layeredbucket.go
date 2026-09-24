@@ -8,6 +8,9 @@ import (
 type layeredBucket[T any] struct {
 	sync.RWMutex
 	buckets map[string]*bucket[T]
+	// nowFn is the clock shared with the owning state machine; newly created
+	// secondary buckets inherit it so their insertion times match the cache's.
+	nowFn func() time.Time
 }
 
 func (b *layeredBucket[T]) itemCount() int {
@@ -42,7 +45,7 @@ func (b *layeredBucket[T]) set(primary, secondary string, value T, duration time
 	b.Lock()
 	bkt, exists := b.buckets[primary]
 	if !exists {
-		bkt = &bucket[T]{lookup: make(map[string]*Item[T])}
+		bkt = &bucket[T]{lookup: make(map[string]*Item[T]), nowFn: b.nowFn}
 		b.buckets[primary] = bkt
 	}
 	b.Unlock()
@@ -69,6 +72,18 @@ func (b *layeredBucket[T]) delete(primary, secondary string) {
 		return
 	}
 	bucket.delete(secondary)
+}
+
+// deleteIf is the identity-guarded counterpart of delete. It returns false
+// without touching the lookup if the key now maps to a different item.
+func (b *layeredBucket[T]) deleteIf(primary, secondary string, item *Item[T]) bool {
+	b.RLock()
+	bucket, exists := b.buckets[primary]
+	b.RUnlock()
+	if !exists {
+		return false
+	}
+	return bucket.deleteIf(secondary, item)
 }
 
 func (b *layeredBucket[T]) deletePrefix(primary, prefix string, deletables chan *Item[T]) int {

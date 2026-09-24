@@ -2,43 +2,71 @@
 package ccache
 
 import (
+	"errors"
 	"hash/fnv"
-	"sync/atomic"
+	"sync"
 	"time"
 )
 
 type Cache[T any] struct {
 	*Configuration[T]
 	control
-	list            *List[T]
-	size            int64
-	pruneTargetSize int64
-	buckets         []*bucket[T]
-	bucketMask      uint32
-	deletables      chan *Item[T]
-	promotables     chan *Item[T]
+	core *lruCore[T]
+
+	buckets    []*bucket[T]
+	bucketMask uint32
+
+	// flights collapses concurrent Fetch misses for the same key into a single
+	// fetch invocation. The hot (hit) path never touches it.
+	flightsMu sync.Mutex
+	flights   map[string]*fetchCall[T]
 }
 
 // Create a new cache with the specified configuration
 // See ccache.Configure() for creating a configuration
 func New[T any](config *Configuration[T]) *Cache[T] {
-	c := &Cache[T]{
-		list:            NewList[T](),
-		Configuration:   config,
-		control:         newControl(),
-		bucketMask:      uint32(config.buckets) - 1,
-		buckets:         make([]*bucket[T], config.buckets),
-		deletables:      make(chan *Item[T], config.deleteBuffer),
-		promotables:     make(chan *Item[T], config.promoteBuffer),
-		pruneTargetSize: config.maxSize - config.maxSize*int64(config.percentToPrune)/100,
-	}
+	buckets := make([]*bucket[T], config.buckets)
 	for i := 0; i < config.buckets; i++ {
-		c.buckets[i] = &bucket[T]{
+		buckets[i] = &bucket[T]{
 			lookup: make(map[string]*Item[T]),
+			nowFn:  config.nowFn,
 		}
 	}
-	go c.worker()
+	c := &Cache[T]{
+		Configuration: config,
+		control:       newControl(),
+		bucketMask:    uint32(config.buckets) - 1,
+		buckets:       buckets,
+		flights:       make(map[string]*fetchCall[T]),
+	}
+	c.core = newLRUCore(config, c.control, lruHooks[T]{
+		evict: func(item *Item[T]) bool {
+			return c.bucket(item.key).deleteIf(item.key, item)
+		},
+		lockAll: func() {
+			for _, bucket := range c.buckets {
+				bucket.Lock()
+			}
+		},
+		unlockAll: func() {
+			for _, bucket := range c.buckets {
+				bucket.Unlock()
+			}
+		},
+		clearLookup: func() {
+			for _, bucket := range c.buckets {
+				bucket.clear()
+			}
+		},
+	})
 	return c
+}
+
+// list exposes the recency list owned by the state machine. It exists only to
+// preserve the read-only field access used by callers; the state machine is the
+// sole mutator.
+func (c *Cache[T]) list() *List[T] {
+	return c.core.list
 }
 
 func (c *Cache[T]) ItemCount() int {
@@ -52,7 +80,7 @@ func (c *Cache[T]) ItemCount() int {
 func (c *Cache[T]) DeletePrefix(prefix string) int {
 	count := 0
 	for _, b := range c.buckets {
-		count += b.deletePrefix(prefix, c.deletables)
+		count += b.deletePrefix(prefix, c.core.deletables)
 	}
 	return count
 }
@@ -61,7 +89,7 @@ func (c *Cache[T]) DeletePrefix(prefix string) int {
 func (c *Cache[T]) DeleteFunc(matches func(key string, item *Item[T]) bool) int {
 	count := 0
 	for _, b := range c.buckets {
-		count += b.deleteFunc(matches, c.deletables)
+		count += b.deleteFunc(matches, c.core.deletables)
 	}
 	return count
 }
@@ -83,12 +111,7 @@ func (c *Cache[T]) Get(key string) *Item[T] {
 	if item == nil {
 		return nil
 	}
-	if !item.Expired() {
-		select {
-		case c.promotables <- item:
-		default:
-		}
-	}
+	c.core.offerPromote(item)
 	return item
 }
 
@@ -129,15 +152,10 @@ func (c *Cache[T]) Setnx(key string, value T, duration time.Duration) {
 // Setnx2 set the value in the cache for the specified duration if not exists
 func (c *Cache[T]) Setnx2(key string, f func() T, duration time.Duration) *Item[T] {
 	item, existing := c.bucket(key).setnx2(key, f, duration, false)
-	// consistent with Get
-	if existing && !item.Expired() {
-		select {
-		case c.promotables <- item:
-		default:
-		}
-		// consistent with set
-	} else if !existing {
-		c.promotables <- item
+	if existing {
+		c.core.offerPromote(item)
+	} else {
+		c.core.enqueuePromote(item)
 	}
 	return item
 }
@@ -166,29 +184,81 @@ func (c *Cache[T]) Extend(key string, duration time.Duration) bool {
 	return true
 }
 
+// ErrFetchRejected is returned to every waiter when the single leader of a
+// concurrent Fetch group returns an error. It wraps the fetch error, so errors
+// .Is(err, ErrFetchRejected) distinguishes a shared failure without hiding the
+// original error layer.
+var ErrFetchRejected = errors.New("ccache: fetch rejected by the shared loader")
+
+// fetchCall is one in-flight single-flight load.
+type fetchCall[T any] struct {
+	done chan struct{}
+	item *Item[T]
+	err  error
+}
+
 // Attempts to get the value from the cache and calles fetch on a miss (missing
-// or stale item). If fetch returns an error, no value is cached and the error
-// is returned back to the caller.
-// Note that Fetch merely calls the public Get and Set functions. If you want
-// a different Fetch behavior, such as thundering herd protection or returning
-// expired items, implement it in your application.
+// or stale item). Concurrent calls for the same missing key collapse into a
+// single fetch invocation: the leader calls fetch exactly once, and every
+// waiter receives the same item or, on failure, the same wrapped error. If
+// fetch returns an error, nothing is cached.
 func (c *Cache[T]) Fetch(key string, duration time.Duration, fetch func() (T, error)) (*Item[T], error) {
 	item := c.Get(key)
 	if item != nil && !item.Expired() {
 		return item, nil
 	}
+
+	c.flightsMu.Lock()
+	if call := c.flights[key]; call != nil {
+		c.flightsMu.Unlock()
+		<-call.done
+		// The leader's Set may have lost an overwrite race; read the
+		// authoritative current value.
+		if current := c.GetWithoutPromote(key); current != nil && !c.core.expired(current) {
+			return current, nil
+		}
+		return nil, call.err
+	}
+	call := &fetchCall[T]{done: make(chan struct{})}
+	c.flights[key] = call
+	c.flightsMu.Unlock()
+
+	defer func() {
+		c.flightsMu.Lock()
+		delete(c.flights, key)
+		c.flightsMu.Unlock()
+		close(call.done)
+	}()
+
 	value, err := fetch()
 	if err != nil {
-		return nil, err
+		call.err = fmtErrorf(err)
+		return nil, call.err
 	}
-	return c.set(key, value, duration, false), nil
+	item = c.set(key, value, duration, false)
+	call.item = item
+	return item, nil
+}
+
+func fmtErrorf(err error) error {
+	return &fetchError{err: err}
+}
+
+type fetchError struct {
+	err error
+}
+
+func (e *fetchError) Error() string { return ErrFetchRejected.Error() + ": " + e.err.Error() }
+func (e *fetchError) Unwrap() error { return e.err }
+func (e *fetchError) Is(target error) bool {
+	return target == ErrFetchRejected || target == e.err
 }
 
 // Remove the item from the cache, return true if the item was present, false otherwise.
 func (c *Cache[T]) Delete(key string) bool {
 	item := c.bucket(key).remove(key)
 	if item != nil {
-		c.deletables <- item
+		c.core.enqueueDelete(item)
 		return true
 	}
 	return false
@@ -197,9 +267,9 @@ func (c *Cache[T]) Delete(key string) bool {
 func (c *Cache[T]) set(key string, value T, duration time.Duration, track bool) *Item[T] {
 	item, existing := c.bucket(key).set(key, value, duration, track)
 	if existing != nil {
-		c.deletables <- existing
+		c.core.enqueueDelete(existing)
 	}
-	c.promotables <- item
+	c.core.enqueuePromote(item)
 	return item
 }
 
@@ -207,187 +277,4 @@ func (c *Cache[T]) bucket(key string) *bucket[T] {
 	h := fnv.New32a()
 	h.Write([]byte(key))
 	return c.buckets[h.Sum32()&c.bucketMask]
-}
-
-func (c *Cache[T]) halted(fn func()) {
-	c.halt()
-	defer c.unhalt()
-	fn()
-}
-
-func (c *Cache[T]) halt() {
-	for _, bucket := range c.buckets {
-		bucket.Lock()
-	}
-}
-
-func (c *Cache[T]) unhalt() {
-	for _, bucket := range c.buckets {
-		bucket.Unlock()
-	}
-}
-
-func (c *Cache[T]) worker() {
-	dropped := 0
-	cc := c.control
-
-	promoteItem := func(item *Item[T]) {
-		if c.doPromote(item) && c.size > c.maxSize {
-			dropped += c.gc()
-		}
-	}
-
-	for {
-		select {
-		case item := <-c.promotables:
-			promoteItem(item)
-		case item := <-c.deletables:
-			c.doDelete(item)
-		case control := <-cc:
-			switch msg := control.(type) {
-			case controlStop:
-				goto drain
-			case controlGetDropped:
-				msg.res <- dropped
-				dropped = 0
-			case controlSetMaxSize:
-				newMaxSize := msg.size
-				c.maxSize = newMaxSize
-				c.pruneTargetSize = newMaxSize - newMaxSize*int64(c.percentToPrune)/100
-				if c.size > c.maxSize {
-					dropped += c.gc()
-				}
-				msg.done <- struct{}{}
-			case controlClear:
-				c.halted(func() {
-					promotables := c.promotables
-					for len(promotables) > 0 {
-						<-promotables
-					}
-					deletables := c.deletables
-					for len(deletables) > 0 {
-						<-deletables
-					}
-
-					for _, bucket := range c.buckets {
-						bucket.clear()
-					}
-					c.size = 0
-					c.list = NewList[T]()
-				})
-				msg.done <- struct{}{}
-			case controlGetSize:
-				msg.res <- c.size
-			case controlGC:
-				dropped += c.gc()
-				msg.done <- struct{}{}
-			case controlSyncUpdates:
-				doAllPendingPromotesAndDeletes(c.promotables, promoteItem, c.deletables, c.doDelete)
-				msg.done <- struct{}{}
-			}
-		}
-	}
-
-drain:
-	for {
-		select {
-		case item := <-c.deletables:
-			c.doDelete(item)
-		default:
-			return
-		}
-	}
-}
-
-// This method is used to implement SyncUpdates. It simply receives and processes as many
-// items as it can receive from the promotables and deletables channels immediately without
-// blocking. If some other goroutine sends an item on either channel after this method has
-// finished receiving, that's OK, because SyncUpdates only guarantees processing of values
-// that were already sent by the same goroutine.
-func doAllPendingPromotesAndDeletes[T any](
-	promotables <-chan *Item[T],
-	promoteFn func(*Item[T]),
-	deletables <-chan *Item[T],
-	deleteFn func(*Item[T]),
-) {
-doAllPromotes:
-	for {
-		select {
-		case item := <-promotables:
-			promoteFn(item)
-		default:
-			break doAllPromotes
-		}
-	}
-doAllDeletes:
-	for {
-		select {
-		case item := <-deletables:
-			deleteFn(item)
-		default:
-			break doAllDeletes
-		}
-	}
-}
-
-func (c *Cache[T]) doDelete(item *Item[T]) {
-	if !item.inList {
-		item.promotions = -2
-	} else {
-		c.size -= item.size
-		if c.onDelete != nil {
-			c.onDelete(item)
-		}
-		c.list.Remove(item)
-		item.promotions = -2
-	}
-}
-
-func (c *Cache[T]) doPromote(item *Item[T]) bool {
-	// already deleted
-	if item.promotions == -2 {
-		return false
-	}
-
-	if item.inList {
-		if item.shouldPromote(c.getsPerPromote) {
-			c.list.MoveToFront(item)
-			item.promotions = 0
-		}
-		return false
-	}
-
-	c.size += item.size
-	c.list.Insert(item)
-	return true
-}
-
-func (c *Cache[T]) gc() int {
-	dropped := 0
-	item := c.list.Tail
-
-	prunedSize := int64(0)
-	sizeToPrune := c.size - c.pruneTargetSize
-
-	for prunedSize < sizeToPrune {
-		if item == nil {
-			return dropped
-		}
-		prev := item.prev
-		if !c.tracking || atomic.LoadInt32(&item.refCount) == 0 {
-			c.bucket(item.key).delete(item.key)
-			itemSize := item.size
-			c.size -= itemSize
-			prunedSize += itemSize
-
-			c.list.Remove(item)
-			if c.onDelete != nil {
-				c.onDelete(item)
-			}
-			dropped += 1
-			item.promotions = -2
-		}
-		item = prev
-	}
-	return dropped
 }

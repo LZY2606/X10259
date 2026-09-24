@@ -10,6 +10,36 @@ type Sized interface {
 	Size() int64
 }
 
+// lifecycle is the single, authoritative state an item moves through. It records
+// which owner currently holds the item:
+//   - lifecycleQueued: the item exists in a bucket lookup, and may be queued in
+//     the promotables channel, but it is not in the LRU list
+//   - lifecyclePromoted: the item exists in a bucket lookup and in the LRU list
+//   - lifecycleTerminal: the item has been deleted/evicted/expired-as-late-
+//     promotion; a late promotables/deletables message must never revive it
+//
+// Every transition is performed by the single worker goroutine through the
+// state-machine functions on lruCore, so the field itself needs no atomic
+// protection. Callers only enqueue *Item messages; they never mutate state.
+type lifecycle int8
+
+const (
+	lifecycleQueued lifecycle = iota
+	lifecyclePromoted
+	lifecycleTerminal
+)
+
+func (s lifecycle) String() string {
+	switch s {
+	case lifecycleQueued:
+		return "queued"
+	case lifecyclePromoted:
+		return "promoted"
+	default:
+		return "terminal"
+	}
+}
+
 type TrackedItem[T any] interface {
 	Value() T
 	Release()
@@ -30,6 +60,7 @@ type Item[T any] struct {
 	next       *Item[T]
 	prev       *Item[T]
 	inList     bool
+	state      lifecycle
 }
 
 func newItem[T any](key string, value T, expires int64, track bool) *Item[T] {
@@ -56,6 +87,20 @@ func newItem[T any](key string, value T, expires int64, track bool) *Item[T] {
 func (i *Item[T]) shouldPromote(getsPerPromote int32) bool {
 	i.promotions += 1
 	return i.promotions == getsPerPromote
+}
+
+// isTerminal reports whether the item has already left the cache. It exists so
+// that a message sitting in the promotables or deletables queues can be checked
+// against the single state machine instead of relying on a magic counter value.
+func (i *Item[T]) isTerminal() bool {
+	return i.state == lifecycleTerminal
+}
+
+// retire is the only way to move an item to the terminal state. It is invoked
+// solely from the worker-side state-machine transitions.
+func (i *Item[T]) retire() {
+	i.state = lifecycleTerminal
+	i.promotions = -2
 }
 
 func (i *Item[T]) Key() string {

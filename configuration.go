@@ -1,5 +1,7 @@
 package ccache
 
+import "time"
+
 type Configuration[T any] struct {
 	maxSize        int64
 	buckets        int
@@ -9,6 +11,16 @@ type Configuration[T any] struct {
 	getsPerPromote int32
 	tracking       bool
 	onDelete       func(item *Item[T])
+	// nowFn is the clock used for every expiration decision made while an item
+	// moves through the cache (insertion, promotion gating). Production caches
+	// use time.Now; the zero value is wired up to it in New/Layered. Exposing it
+	// only through the unexported configuration field keeps it invisible to
+	// callers while letting tests share the exact production code paths.
+	nowFn func() time.Time
+	// manual, when true, keeps New/Layered from spawning the background worker.
+	// Tests then drive the same state-machine transitions the worker runs by
+	// means of the step* helpers; no separate algorithm exists for tests.
+	manual bool
 }
 
 // Creates a configuration object with sensible defaults

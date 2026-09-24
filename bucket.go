@@ -9,6 +9,17 @@ import (
 type bucket[T any] struct {
 	sync.RWMutex
 	lookup map[string]*Item[T]
+	// nowFn is the injectable clock shared with the owning state machine. nil
+	// means bucket-level tests construct the bucket directly with the wall
+	// clock; caches always wire it through Configuration.
+	nowFn func() time.Time
+}
+
+func (b *bucket[T]) now() time.Time {
+	if b.nowFn != nil {
+		return b.nowFn()
+	}
+	return time.Now()
 }
 
 func (b *bucket[T]) itemCount() int {
@@ -43,7 +54,7 @@ func (b *bucket[T]) setnx(key string, value T, duration time.Duration, track boo
 		return item
 	}
 
-	expires := time.Now().Add(duration).UnixNano()
+	expires := b.now().Add(duration).UnixNano()
 	newItem := newItem(key, value, expires, track)
 
 	b.Lock()
@@ -76,7 +87,7 @@ func (b *bucket[T]) setnx2(key string, f func() T, duration time.Duration, track
 		return item, true
 	}
 
-	expires := time.Now().Add(duration).UnixNano()
+	expires := b.now().Add(duration).UnixNano()
 	newItem := newItem(key, f(), expires, track)
 
 	b.lookup[key] = newItem
@@ -84,7 +95,7 @@ func (b *bucket[T]) setnx2(key string, f func() T, duration time.Duration, track
 }
 
 func (b *bucket[T]) set(key string, value T, duration time.Duration, track bool) (*Item[T], *Item[T]) {
-	expires := time.Now().Add(duration).UnixNano()
+	expires := b.now().Add(duration).UnixNano()
 	item := newItem(key, value, expires, track)
 	b.Lock()
 	existing := b.lookup[key]
@@ -105,6 +116,22 @@ func (b *bucket[T]) delete(key string) {
 	b.Lock()
 	delete(b.lookup, key)
 	b.Unlock()
+}
+
+// deleteIf removes key from the lookup only while the lookup still maps it to
+// item. It closes the window in which an evicted item's key was overwritten
+// after the eviction candidate was selected: deleting by key alone in that
+// window would delete the replacement item and resurrect the evicted one in the
+// LRU list of callers (Get would return nil although the LRU still counts it).
+func (b *bucket[T]) deleteIf(key string, item *Item[T]) bool {
+	b.Lock()
+	if b.lookup[key] != item {
+		b.Unlock()
+		return false
+	}
+	delete(b.lookup, key)
+	b.Unlock()
+	return true
 }
 
 // This is an expensive operation, so we do what we can to optimize it and limit
@@ -155,7 +182,7 @@ func (b *bucket[T]) deletePrefix(prefix string, deletables chan *Item[T]) int {
 // we expect the caller to have acquired a write lock
 func (b *bucket[T]) clear() {
 	for _, item := range b.lookup {
-		item.promotions = -2
+		item.retire()
 	}
 	b.lookup = make(map[string]*Item[T])
 }

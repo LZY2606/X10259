@@ -3,20 +3,22 @@ package ccache
 
 import (
 	"hash/fnv"
-	"sync/atomic"
+	"sync"
 	"time"
 )
 
 type LayeredCache[T any] struct {
 	*Configuration[T]
 	control
-	list            *List[T]
-	buckets         []*layeredBucket[T]
-	bucketMask      uint32
-	size            int64
-	pruneTargetSize int64
-	deletables      chan *Item[T]
-	promotables     chan *Item[T]
+	core *lruCore[T]
+
+	buckets    []*layeredBucket[T]
+	bucketMask uint32
+
+	// flights collapses concurrent Fetch misses for the same primary/secondary
+	// key pair into a single fetch invocation. The hit path never touches it.
+	flightsMu sync.Mutex
+	flights   map[string]*fetchCall[T]
 }
 
 // Create a new layered cache with the specified configuration.
@@ -25,7 +27,7 @@ type LayeredCache[T any] struct {
 // secondary key. However, DeleteAll requires only a primary key, deleting
 // all values that share the same primary key.
 
-// Layered Cache is useful as an HTTP cache, where an HTTP purge might
+// Layered Cache is useful as an HTTP cache, for where an HTTP purge might
 // delete multiple variants of the same resource:
 // primary key = "user/44"
 // secondary key 1 = ".json"
@@ -33,22 +35,40 @@ type LayeredCache[T any] struct {
 
 // See ccache.Configure() for creating a configuration
 func Layered[T any](config *Configuration[T]) *LayeredCache[T] {
-	c := &LayeredCache[T]{
-		list:            NewList[T](),
-		Configuration:   config,
-		control:         newControl(),
-		bucketMask:      uint32(config.buckets) - 1,
-		buckets:         make([]*layeredBucket[T], config.buckets),
-		deletables:      make(chan *Item[T], config.deleteBuffer),
-		promotables:     make(chan *Item[T], config.promoteBuffer),
-		pruneTargetSize: config.maxSize - config.maxSize*int64(config.percentToPrune)/100,
-	}
+	buckets := make([]*layeredBucket[T], config.buckets)
 	for i := 0; i < config.buckets; i++ {
-		c.buckets[i] = &layeredBucket[T]{
+		buckets[i] = &layeredBucket[T]{
 			buckets: make(map[string]*bucket[T]),
+			nowFn:   config.nowFn,
 		}
 	}
-	go c.worker()
+	c := &LayeredCache[T]{
+		Configuration: config,
+		control:       newControl(),
+		bucketMask:    uint32(config.buckets) - 1,
+		buckets:       buckets,
+		flights:       make(map[string]*fetchCall[T]),
+	}
+	c.core = newLRUCore(config, c.control, lruHooks[T]{
+		evict: func(item *Item[T]) bool {
+			return c.bucket(item.group).deleteIf(item.group, item.key, item)
+		},
+		lockAll: func() {
+			for _, bucket := range c.buckets {
+				bucket.Lock()
+			}
+		},
+		unlockAll: func() {
+			for _, bucket := range c.buckets {
+				bucket.Unlock()
+			}
+		},
+		clearLookup: func() {
+			for _, bucket := range c.buckets {
+				bucket.clear()
+			}
+		},
+	})
 	return c
 }
 
@@ -69,12 +89,7 @@ func (c *LayeredCache[T]) Get(primary, secondary string) *Item[T] {
 	if item == nil {
 		return nil
 	}
-	if item.expires > time.Now().UnixNano() {
-		select {
-		case c.promotables <- item:
-		default:
-		}
-	}
+	c.core.offerPromote(item)
 	return item
 }
 
@@ -97,7 +112,7 @@ func (c *LayeredCache[T]) GetOrCreateSecondaryCache(primary string) *SecondaryCa
 	bkt := primaryBkt.getSecondaryBucket(primary)
 	primaryBkt.Lock()
 	if bkt == nil {
-		bkt = &bucket[T]{lookup: make(map[string]*Item[T])}
+		bkt = &bucket[T]{lookup: make(map[string]*Item[T]), nowFn: c.nowFn}
 		primaryBkt.buckets[primary] = bkt
 	}
 	primaryBkt.Unlock()
@@ -141,19 +156,41 @@ func (c *LayeredCache[T]) Replace(primary, secondary string, value T) bool {
 }
 
 // Attempts to get the value from the cache and calles fetch on a miss.
-// If fetch returns an error, no value is cached and the error is returned back
-// to the caller.
-// Note that Fetch merely calls the public Get and Set functions. If you want
-// a different Fetch behavior, such as thundering herd protection or returning
-// expired items, implement it in your application.
+// Concurrent calls for the same missing primary/secondary pair collapse into a
+// single fetch invocation: the leader calls fetch exactly once and waiters
+// receive the same item or wrapped error. If fetch returns an error, no value
+// is cached and the error is returned back to the caller.
 func (c *LayeredCache[T]) Fetch(primary, secondary string, duration time.Duration, fetch func() (T, error)) (*Item[T], error) {
 	item := c.Get(primary, secondary)
-	if item != nil {
+	if item != nil && !item.Expired() {
 		return item, nil
 	}
+
+	key := primary + "\x00" + secondary
+	c.flightsMu.Lock()
+	if call := c.flights[key]; call != nil {
+		c.flightsMu.Unlock()
+		<-call.done
+		if current := c.GetWithoutPromote(primary, secondary); current != nil && !c.core.expired(current) {
+			return current, nil
+		}
+		return nil, call.err
+	}
+	call := &fetchCall[T]{done: make(chan struct{})}
+	c.flights[key] = call
+	c.flightsMu.Unlock()
+
+	defer func() {
+		c.flightsMu.Lock()
+		delete(c.flights, key)
+		c.flightsMu.Unlock()
+		close(call.done)
+	}()
+
 	value, err := fetch()
 	if err != nil {
-		return nil, err
+		call.err = fmtErrorf(err)
+		return nil, call.err
 	}
 	return c.set(primary, secondary, value, duration, false), nil
 }
@@ -162,7 +199,7 @@ func (c *LayeredCache[T]) Fetch(primary, secondary string, duration time.Duratio
 func (c *LayeredCache[T]) Delete(primary, secondary string) bool {
 	item := c.bucket(primary).remove(primary, secondary)
 	if item != nil {
-		c.deletables <- item
+		c.core.enqueueDelete(item)
 		return true
 	}
 	return false
@@ -170,25 +207,25 @@ func (c *LayeredCache[T]) Delete(primary, secondary string) bool {
 
 // Deletes all items that share the same primary key
 func (c *LayeredCache[T]) DeleteAll(primary string) bool {
-	return c.bucket(primary).deleteAll(primary, c.deletables)
+	return c.bucket(primary).deleteAll(primary, c.core.deletables)
 }
 
 // Deletes all items that share the same primary key and prefix.
 func (c *LayeredCache[T]) DeletePrefix(primary, prefix string) int {
-	return c.bucket(primary).deletePrefix(primary, prefix, c.deletables)
+	return c.bucket(primary).deletePrefix(primary, prefix, c.core.deletables)
 }
 
 // Deletes all items that share the same primary key and where the matches func evaluates to true.
 func (c *LayeredCache[T]) DeleteFunc(primary string, matches func(key string, item *Item[T]) bool) int {
-	return c.bucket(primary).deleteFunc(primary, matches, c.deletables)
+	return c.bucket(primary).deleteFunc(primary, matches, c.core.deletables)
 }
 
 func (c *LayeredCache[T]) set(primary, secondary string, value T, duration time.Duration, track bool) *Item[T] {
 	item, existing := c.bucket(primary).set(primary, secondary, value, duration, track)
 	if existing != nil {
-		c.deletables <- existing
+		c.core.enqueueDelete(existing)
 	}
-	c.promote(item)
+	c.core.enqueuePromote(item)
 	return item
 }
 
@@ -196,161 +233,4 @@ func (c *LayeredCache[T]) bucket(key string) *layeredBucket[T] {
 	h := fnv.New32a()
 	h.Write([]byte(key))
 	return c.buckets[h.Sum32()&c.bucketMask]
-}
-
-func (c *LayeredCache[T]) halted(fn func()) {
-	c.halt()
-	defer c.unhalt()
-	fn()
-}
-
-func (c *LayeredCache[T]) halt() {
-	for _, bucket := range c.buckets {
-		bucket.Lock()
-	}
-}
-
-func (c *LayeredCache[T]) unhalt() {
-	for _, bucket := range c.buckets {
-		bucket.Unlock()
-	}
-}
-
-func (c *LayeredCache[T]) promote(item *Item[T]) {
-	c.promotables <- item
-}
-
-func (c *LayeredCache[T]) worker() {
-	dropped := 0
-	cc := c.control
-
-	promoteItem := func(item *Item[T]) {
-		if c.doPromote(item) && c.size > c.maxSize {
-			dropped += c.gc()
-		}
-	}
-
-	for {
-		select {
-		case item := <-c.promotables:
-			promoteItem(item)
-		case item := <-c.deletables:
-			c.doDelete(item)
-		case control := <-cc:
-			switch msg := control.(type) {
-			case controlStop:
-				goto drain
-			case controlGetDropped:
-				msg.res <- dropped
-				dropped = 0
-			case controlSetMaxSize:
-				newMaxSize := msg.size
-				c.maxSize = newMaxSize
-				c.pruneTargetSize = newMaxSize - newMaxSize*int64(c.percentToPrune)/100
-				if c.size > c.maxSize {
-					dropped += c.gc()
-				}
-				msg.done <- struct{}{}
-			case controlClear:
-				promotables := c.promotables
-				for len(promotables) > 0 {
-					<-promotables
-				}
-				deletables := c.deletables
-				for len(deletables) > 0 {
-					<-deletables
-				}
-
-				c.halted(func() {
-					for _, bucket := range c.buckets {
-						bucket.clear()
-					}
-					c.size = 0
-					c.list = NewList[T]()
-				})
-				msg.done <- struct{}{}
-			case controlGetSize:
-				msg.res <- c.size
-			case controlGC:
-				dropped += c.gc()
-				msg.done <- struct{}{}
-			case controlSyncUpdates:
-				doAllPendingPromotesAndDeletes(c.promotables, promoteItem, c.deletables, c.doDelete)
-				msg.done <- struct{}{}
-			}
-		}
-	}
-
-drain:
-	for {
-		select {
-		case item := <-c.deletables:
-			c.doDelete(item)
-		default:
-			return
-		}
-	}
-}
-
-func (c *LayeredCache[T]) doDelete(item *Item[T]) {
-	if !item.inList {
-		item.promotions = -2
-	} else {
-		c.size -= item.size
-		if c.onDelete != nil {
-			c.onDelete(item)
-		}
-		c.list.Remove(item)
-		item.promotions = -2
-	}
-}
-
-func (c *LayeredCache[T]) doPromote(item *Item[T]) bool {
-	// deleted before it ever got promoted
-	if item.promotions == -2 {
-		return false
-	}
-
-	if item.inList {
-		if item.shouldPromote(c.getsPerPromote) {
-			c.list.MoveToFront(item)
-			item.promotions = 0
-		}
-		return false
-	}
-
-	c.size += item.size
-	c.list.Insert(item)
-	return true
-}
-
-func (c *LayeredCache[T]) gc() int {
-	dropped := 0
-	item := c.list.Tail
-
-	prunedSize := int64(0)
-	sizeToPrune := c.size - c.pruneTargetSize
-
-	for prunedSize < sizeToPrune {
-		if item == nil {
-			return dropped
-		}
-		prev := item.prev
-		if !c.tracking || atomic.LoadInt32(&item.refCount) == 0 {
-
-			c.bucket(item.group).delete(item.group, item.key)
-			itemSize := item.size
-			c.size -= itemSize
-			prunedSize += itemSize
-
-			c.list.Remove(item)
-			if c.onDelete != nil {
-				c.onDelete(item)
-			}
-			dropped += 1
-			item.promotions = -2
-		}
-		item = prev
-	}
-	return dropped
 }
