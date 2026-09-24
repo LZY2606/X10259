@@ -30,6 +30,44 @@ type Item[T any] struct {
 	next       *Item[T]
 	prev       *Item[T]
 	inList     bool
+	state      itemState
+}
+
+// itemState is the single source of truth for where an Item lives with
+// respect to the cache's three ownership locations: the bucket lookup, the
+// promotables queue (or the LRU list once promoted) and the deletables queue.
+//
+// Every transition is performed by the single background worker through
+// (*lru).promote and (*lru).retire, which means the field does not need
+// atomic access. Callers (Get/Set/Delete) only stage items into queues and
+// never mutate the state themselves.
+type itemState uint8
+
+const (
+	// stateQueued: the item is the current occupant of its bucket slot and is
+	// either waiting in the promotables queue or has not been promoted yet. It
+	// is not owned by the LRU list.
+	stateQueued itemState = iota
+	// statePromoted: the item is the current occupant of its bucket slot and is
+	// owned by the LRU list, contributing to the cache's size.
+	statePromoted
+	// stateDeleted is terminal. The item no longer contributes to the cache: it
+	// has been removed from the LRU list (if it ever reached it) and its
+	// onDelete callback, if any, has already been invoked. A late promotion or
+	// deletion message for this item is a no-op.
+	stateDeleted
+)
+
+func (s itemState) String() string {
+	switch s {
+	case stateQueued:
+		return "queued"
+	case statePromoted:
+		return "promoted"
+	case stateDeleted:
+		return "deleted"
+	}
+	return "unknown"
 }
 
 func newItem[T any](key string, value T, expires int64, track bool) *Item[T] {
@@ -41,11 +79,11 @@ func newItem[T any](key string, value T, expires int64, track bool) *Item[T] {
 	}
 
 	item := &Item[T]{
-		key:        key,
-		value:      value,
-		promotions: 0,
-		size:       size,
-		expires:    expires,
+		key:     key,
+		value:   value,
+		size:    size,
+		expires: expires,
+		state:   stateQueued,
 	}
 	if track {
 		item.refCount = 1
@@ -105,4 +143,24 @@ func (i *Item[T]) String() string {
 		return fmt.Sprintf("Item(%s:%v)", i.key, i.value)
 	}
 	return fmt.Sprintf("Item(%s:%s:%v)", group, i.key, i.value)
+}
+
+// markDeleted records the terminal transition. The promotions counter is also
+// set to -2 for backwards-compatible observability (the previous implementation
+// used -2 as its "deleted" sentinel); all new logic keys off item.state.
+func (i *Item[T]) markDeleted() {
+	i.state = stateDeleted
+	i.promotions = -2
+}
+
+// expiredAt reports whether the item expired relative to now. All internal
+// liveness decisions route through this method so tests can drive time
+// deterministically with a fake clock.
+func (i *Item[T]) expiredAt(now int64) bool {
+	return atomic.LoadInt64(&i.expires) < now
+}
+
+// expireAbsolute computes the absolute expiration instant relative to clock.
+func expireAbsolute(clock Clock, duration time.Duration) int64 {
+	return clock.Now().Add(duration).UnixNano()
 }
