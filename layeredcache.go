@@ -69,7 +69,7 @@ func (c *LayeredCache[T]) Get(primary, secondary string) *Item[T] {
 	if item == nil {
 		return nil
 	}
-	if item.expires > time.Now().UnixNano() {
+	if !item.Expired() {
 		select {
 		case c.promotables <- item:
 		default:
@@ -258,12 +258,18 @@ func (c *LayeredCache[T]) worker() {
 				}
 				deletables := c.deletables
 				for len(deletables) > 0 {
-					<-deletables
+					(<-deletables).abandon()
 				}
 
 				c.halted(func() {
 					for _, bucket := range c.buckets {
 						bucket.clear()
+					}
+					// Abandon anything left in the eviction list (e.g.
+					// items whose delete was drained above), so no item
+					// is left in a live state the cache has forgotten.
+					for item := c.list.Head; item != nil; item = item.next {
+						item.abandon()
 					}
 					c.size = 0
 					c.list = NewList[T]()
@@ -293,35 +299,17 @@ drain:
 }
 
 func (c *LayeredCache[T]) doDelete(item *Item[T]) {
-	if !item.inList {
-		item.promotions = -2
-	} else {
-		c.size -= item.size
-		if c.onDelete != nil {
-			c.onDelete(item)
-		}
-		c.list.Remove(item)
-		item.promotions = -2
+	sizeDelta, fireCallback := item.transitionDelete(c.list)
+	c.size += sizeDelta
+	if fireCallback && c.onDelete != nil {
+		c.onDelete(item)
 	}
 }
 
 func (c *LayeredCache[T]) doPromote(item *Item[T]) bool {
-	// deleted before it ever got promoted
-	if item.promotions == -2 {
-		return false
-	}
-
-	if item.inList {
-		if item.shouldPromote(c.getsPerPromote) {
-			c.list.MoveToFront(item)
-			item.promotions = 0
-		}
-		return false
-	}
-
-	c.size += item.size
-	c.list.Insert(item)
-	return true
+	sizeDelta, admitted := item.transitionPromote(c.list, c.getsPerPromote, timeNow().UnixNano())
+	c.size += sizeDelta
+	return admitted
 }
 
 func (c *LayeredCache[T]) gc() int {
@@ -340,15 +328,14 @@ func (c *LayeredCache[T]) gc() int {
 
 			c.bucket(item.group).delete(item.group, item.key)
 			itemSize := item.size
-			c.size -= itemSize
+			sizeDelta, fireCallback := item.transitionDelete(c.list)
+			c.size += sizeDelta
 			prunedSize += itemSize
 
-			c.list.Remove(item)
-			if c.onDelete != nil {
+			if fireCallback && c.onDelete != nil {
 				c.onDelete(item)
 			}
 			dropped += 1
-			item.promotions = -2
 		}
 		item = prev
 	}
