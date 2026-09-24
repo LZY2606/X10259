@@ -1,5 +1,7 @@
 package ccache
 
+import "time"
+
 type Configuration[T any] struct {
 	maxSize        int64
 	buckets        int
@@ -9,6 +11,17 @@ type Configuration[T any] struct {
 	getsPerPromote int32
 	tracking       bool
 	onDelete       func(item *Item[T])
+	now            func() time.Time
+}
+
+// nowFn returns the clock the cache should read time from. The unexported
+// field is package visible so tests can install a fake clock; every expiry
+// computation in production and tests flows through this same seam.
+func (c *Configuration[T]) nowFn() func() time.Time {
+	if c.now != nil {
+		return c.now
+	}
+	return time.Now
 }
 
 // Creates a configuration object with sensible defaults
@@ -102,5 +115,13 @@ func (c *Configuration[T]) Track() *Configuration[T] {
 // cached object that require some kind of tear-down.
 func (c *Configuration[T]) OnDelete(callback func(item *Item[T])) *Configuration[T] {
 	c.onDelete = callback
+	return c
+}
+
+// withClock installs an explicit clock. It is an unexported test seam: the
+// installed function is consumed by the same code path as the default
+// time.Now (see Configuration.nowFn and bucket/item expiry checks).
+func (c *Configuration[T]) withClock(now func() time.Time) *Configuration[T] {
+	c.now = now
 	return c
 }

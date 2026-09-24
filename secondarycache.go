@@ -3,6 +3,7 @@ package ccache
 import "time"
 
 type SecondaryCache[T any] struct {
+	group  string
 	bucket *bucket[T]
 	pCache *LayeredCache[T]
 }
@@ -10,17 +11,22 @@ type SecondaryCache[T any] struct {
 // Get the secondary key.
 // The semantics are the same as for LayeredCache.Get
 func (s *SecondaryCache[T]) Get(secondary string) *Item[T] {
-	return s.bucket.get(secondary)
+	item := s.bucket.get(secondary)
+	if item != nil && !item.Expired() {
+		s.pCache.tryQueuePromote(item)
+	}
+	return item
 }
 
 // Set the secondary key to a value.
 // The semantics are the same as for LayeredCache.Set
 func (s *SecondaryCache[T]) Set(secondary string, value T, duration time.Duration) *Item[T] {
 	item, existing := s.bucket.set(secondary, value, duration, false)
+	item.group = s.group
 	if existing != nil {
-		s.pCache.deletables <- existing
+		s.pCache.queueRemove(existing)
 	}
-	s.pCache.promote(item)
+	s.pCache.queuePromote(item)
 	return item
 }
 
@@ -28,7 +34,7 @@ func (s *SecondaryCache[T]) Set(secondary string, value T, duration time.Duratio
 // The semantics are the same as for LayeredCache.Fetch
 func (s *SecondaryCache[T]) Fetch(secondary string, duration time.Duration, fetch func() (T, error)) (*Item[T], error) {
 	item := s.Get(secondary)
-	if item != nil {
+	if item != nil && !item.Expired() {
 		return item, nil
 	}
 	value, err := fetch()
@@ -43,7 +49,7 @@ func (s *SecondaryCache[T]) Fetch(secondary string, duration time.Duration, fetc
 func (s *SecondaryCache[T]) Delete(secondary string) bool {
 	item := s.bucket.remove(secondary)
 	if item != nil {
-		s.pCache.deletables <- item
+		s.pCache.queueRemove(item)
 		return true
 	}
 	return false

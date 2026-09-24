@@ -9,6 +9,20 @@ import (
 type bucket[T any] struct {
 	sync.RWMutex
 	lookup map[string]*Item[T]
+	clock  func() time.Time
+}
+
+func (b *bucket[T]) now() time.Time {
+	if b.clock != nil {
+		return b.clock()
+	}
+	return time.Now()
+}
+
+func (b *bucket[T]) newItem(key string, value T, duration time.Duration, track bool) *Item[T] {
+	item := newItem[T](key, value, b.now().Add(duration).UnixNano(), track)
+	item.clock = b.clock
+	return item
 }
 
 func (b *bucket[T]) itemCount() int {
@@ -43,8 +57,7 @@ func (b *bucket[T]) setnx(key string, value T, duration time.Duration, track boo
 		return item
 	}
 
-	expires := time.Now().Add(duration).UnixNano()
-	newItem := newItem(key, value, expires, track)
+	newItem := b.newItem(key, value, duration, track)
 
 	b.Lock()
 	defer b.Unlock()
@@ -76,16 +89,13 @@ func (b *bucket[T]) setnx2(key string, f func() T, duration time.Duration, track
 		return item, true
 	}
 
-	expires := time.Now().Add(duration).UnixNano()
-	newItem := newItem(key, f(), expires, track)
-
+	newItem := b.newItem(key, f(), duration, track)
 	b.lookup[key] = newItem
 	return newItem, false
 }
 
 func (b *bucket[T]) set(key string, value T, duration time.Duration, track bool) (*Item[T], *Item[T]) {
-	expires := time.Now().Add(duration).UnixNano()
-	item := newItem(key, value, expires, track)
+	item := b.newItem(key, value, duration, track)
 	b.Lock()
 	existing := b.lookup[key]
 	b.lookup[key] = item
@@ -101,6 +111,32 @@ func (b *bucket[T]) remove(key string) *Item[T] {
 	return item
 }
 
+// removeItem deletes the mapping for item's key only when the value currently
+// stored is item itself. This is used by the eviction path: an item that was
+// replaced between the time it entered the recency list and the time it gets
+// pruned must never remove its successor from the bucket.
+// Returns true when the mapping was removed.
+func (b *bucket[T]) removeItem(item *Item[T]) bool {
+	b.Lock()
+	defer b.Unlock()
+	if b.lookup[item.key] != item {
+		return false
+	}
+	delete(b.lookup, item.key)
+	return true
+}
+
+// scan calls fn for every entry while holding the read lock. It exists for the
+// ownership invariant check and walks the very same lookup that the production
+// state machine mutates; it never fabricates state.
+func (b *bucket[T]) scan(fn func(*Item[T])) {
+	b.RLock()
+	defer b.RUnlock()
+	for _, item := range b.lookup {
+		fn(item)
+	}
+}
+
 func (b *bucket[T]) delete(key string) {
 	b.Lock()
 	delete(b.lookup, key)
@@ -108,7 +144,7 @@ func (b *bucket[T]) delete(key string) {
 }
 
 // This is an expensive operation, so we do what we can to optimize it and limit
-// the impact it has on concurrent operations. Specifically, we:
+// the impact on concurrent operations. Specifically, we:
 // 1 - Do an initial iteration to collect matches. This allows us to do the
 //     "expensive" prefix check (on all values) using only a read-lock
 // 2 - Do a second iteration, under write lock, for the matched results to do
@@ -152,10 +188,11 @@ func (b *bucket[T]) deletePrefix(prefix string, deletables chan *Item[T]) int {
 	}, deletables)
 }
 
-// we expect the caller to have acquired a write lock
-func (b *bucket[T]) clear() {
+// resetLocked replaces the lookup with an empty one and marks every previously
+// owned item as removed. The caller must hold the bucket's write lock.
+func (b *bucket[T]) resetLocked() {
 	for _, item := range b.lookup {
-		item.promotions = -2
+		item.setState(itemRemoved)
 	}
 	b.lookup = make(map[string]*Item[T])
 }

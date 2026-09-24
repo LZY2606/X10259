@@ -19,6 +19,25 @@ type TrackedItem[T any] interface {
 	Extend(duration time.Duration)
 }
 
+// Lifecycle states. An item's ownership of its slot in a bucket, its place on
+// the promotables/deletables queues and its membership in the recency list is
+// described by exactly this one state machine:
+//
+//	itemPending: the item is in a bucket, but has never been promoted into the
+//	             recency list.
+//	itemActive:  the item is in a bucket and in the recency list.
+//	itemRemoved: ownership has been released. The item must never be inserted
+//	             into the recency list or counted towards the size again.
+//
+// Only the worker goroutine moves an item between states. The state is kept in
+// an atomic so that external readers (inspection in tests, the debug
+// formatter) never observe a torn transition.
+const (
+	itemPending uint32 = iota
+	itemActive
+	itemRemoved
+)
+
 type Item[T any] struct {
 	key        string
 	group      string
@@ -29,7 +48,8 @@ type Item[T any] struct {
 	value      T
 	next       *Item[T]
 	prev       *Item[T]
-	inList     bool
+	state      uint32
+	clock      func() time.Time
 }
 
 func newItem[T any](key string, value T, expires int64, track bool) *Item[T] {
@@ -46,11 +66,20 @@ func newItem[T any](key string, value T, expires int64, track bool) *Item[T] {
 		promotions: 0,
 		size:       size,
 		expires:    expires,
+		state:      itemPending,
 	}
 	if track {
 		item.refCount = 1
 	}
 	return item
+}
+
+func (i *Item[T]) lifecycleState() uint32 {
+	return atomic.LoadUint32(&i.state)
+}
+
+func (i *Item[T]) setState(state uint32) {
+	atomic.StoreUint32(&i.state, state)
 }
 
 func (i *Item[T]) shouldPromote(getsPerPromote int32) bool {
@@ -74,14 +103,21 @@ func (i *Item[T]) Release() {
 	atomic.AddInt32(&i.refCount, -1)
 }
 
+func (i *Item[T]) now() time.Time {
+	if i.clock != nil {
+		return i.clock()
+	}
+	return time.Now()
+}
+
 func (i *Item[T]) Expired() bool {
 	expires := atomic.LoadInt64(&i.expires)
-	return expires < time.Now().UnixNano()
+	return expires < i.now().UnixNano()
 }
 
 func (i *Item[T]) TTL() time.Duration {
 	expires := atomic.LoadInt64(&i.expires)
-	return time.Nanosecond * time.Duration(expires-time.Now().UnixNano())
+	return time.Nanosecond * time.Duration(expires-i.now().UnixNano())
 }
 
 func (i *Item[T]) Expires() time.Time {
@@ -90,7 +126,7 @@ func (i *Item[T]) Expires() time.Time {
 }
 
 func (i *Item[T]) Extend(duration time.Duration) {
-	atomic.StoreInt64(&i.expires, time.Now().Add(duration).UnixNano())
+	atomic.StoreInt64(&i.expires, i.now().Add(duration).UnixNano())
 }
 
 // String returns a string representation of the Item. This includes the default string
