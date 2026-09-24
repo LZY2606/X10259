@@ -1,5 +1,7 @@
 package ccache
 
+import "time"
+
 type Configuration[T any] struct {
 	maxSize        int64
 	buckets        int
@@ -9,6 +11,7 @@ type Configuration[T any] struct {
 	getsPerPromote int32
 	tracking       bool
 	onDelete       func(item *Item[T])
+	now            func() time.Time
 }
 
 // Creates a configuration object with sensible defaults
@@ -23,6 +26,7 @@ func Configure[T any]() *Configuration[T] {
 		promoteBuffer:  1024,
 		maxSize:        5000,
 		tracking:       false,
+		now:            time.Now,
 	}
 }
 
@@ -102,5 +106,19 @@ func (c *Configuration[T]) Track() *Configuration[T] {
 // cached object that require some kind of tear-down.
 func (c *Configuration[T]) OnDelete(callback func(item *Item[T])) *Configuration[T] {
 	c.onDelete = callback
+	return c
+}
+
+// Clock sets the function used to tell the current time. It drives every
+// expiry decision made by the cache: the absolute expiration computed by
+// Set/Setnx/Fetch and Item's Expired, TTL and Extend methods. It defaults to
+// time.Now. This is primarily provided so tests can advance time with a fake
+// clock; production and tests share the same code path, the clock simply
+// returns a different instant.
+func (c *Configuration[T]) Clock(now func() time.Time) *Configuration[T] {
+	if now == nil {
+		now = time.Now
+	}
+	c.now = now
 	return c
 }

@@ -30,6 +30,7 @@ type Item[T any] struct {
 	next       *Item[T]
 	prev       *Item[T]
 	inList     bool
+	now        func() time.Time
 }
 
 func newItem[T any](key string, value T, expires int64, track bool) *Item[T] {
@@ -74,14 +75,24 @@ func (i *Item[T]) Release() {
 	atomic.AddInt32(&i.refCount, -1)
 }
 
+// timeNow returns the clock governing this item's expiry. Items created by a
+// bucket inherit the cache's (possibly fake) clock; items constructed
+// directly fall back to wall-clock time.
+func (i *Item[T]) timeNow() func() time.Time {
+	if i.now == nil {
+		return time.Now
+	}
+	return i.now
+}
+
 func (i *Item[T]) Expired() bool {
 	expires := atomic.LoadInt64(&i.expires)
-	return expires < time.Now().UnixNano()
+	return expires < i.timeNow()().UnixNano()
 }
 
 func (i *Item[T]) TTL() time.Duration {
 	expires := atomic.LoadInt64(&i.expires)
-	return time.Nanosecond * time.Duration(expires-time.Now().UnixNano())
+	return time.Nanosecond * time.Duration(expires-i.timeNow()().UnixNano())
 }
 
 func (i *Item[T]) Expires() time.Time {
@@ -90,7 +101,7 @@ func (i *Item[T]) Expires() time.Time {
 }
 
 func (i *Item[T]) Extend(duration time.Duration) {
-	atomic.StoreInt64(&i.expires, time.Now().Add(duration).UnixNano())
+	atomic.StoreInt64(&i.expires, i.timeNow()().Add(duration).UnixNano())
 }
 
 // String returns a string representation of the Item. This includes the default string
