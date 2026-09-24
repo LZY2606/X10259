@@ -30,6 +30,7 @@ type Item[T any] struct {
 	next       *Item[T]
 	prev       *Item[T]
 	inList     bool
+	now        func() time.Time
 }
 
 func newItem[T any](key string, value T, expires int64, track bool) *Item[T] {
@@ -76,12 +77,12 @@ func (i *Item[T]) Release() {
 
 func (i *Item[T]) Expired() bool {
 	expires := atomic.LoadInt64(&i.expires)
-	return expires < time.Now().UnixNano()
+	return expires < i.currentTime().UnixNano()
 }
 
 func (i *Item[T]) TTL() time.Duration {
 	expires := atomic.LoadInt64(&i.expires)
-	return time.Nanosecond * time.Duration(expires-time.Now().UnixNano())
+	return time.Nanosecond * time.Duration(expires-i.currentTime().UnixNano())
 }
 
 func (i *Item[T]) Expires() time.Time {
@@ -90,7 +91,17 @@ func (i *Item[T]) Expires() time.Time {
 }
 
 func (i *Item[T]) Extend(duration time.Duration) {
-	atomic.StoreInt64(&i.expires, time.Now().Add(duration).UnixNano())
+	atomic.StoreInt64(&i.expires, i.currentTime().Add(duration).UnixNano())
+}
+
+// currentTime returns the time from the clock the item was created with.
+// A zero-value Item (one not created through a cache) falls back to the
+// system clock.
+func (i *Item[T]) currentTime() time.Time {
+	if i.now == nil {
+		return time.Now()
+	}
+	return i.now()
 }
 
 // String returns a string representation of the Item. This includes the default string

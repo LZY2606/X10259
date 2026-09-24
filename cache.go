@@ -35,6 +35,7 @@ func New[T any](config *Configuration[T]) *Cache[T] {
 	for i := 0; i < config.buckets; i++ {
 		c.buckets[i] = &bucket[T]{
 			lookup: make(map[string]*Item[T]),
+			now:    config.now,
 		}
 	}
 	go c.worker()
@@ -331,35 +332,11 @@ doAllDeletes:
 }
 
 func (c *Cache[T]) doDelete(item *Item[T]) {
-	if !item.inList {
-		item.promotions = -2
-	} else {
-		c.size -= item.size
-		if c.onDelete != nil {
-			c.onDelete(item)
-		}
-		c.list.Remove(item)
-		item.promotions = -2
-	}
+	retireItem(item, c.list, &c.size, c.onDelete)
 }
 
 func (c *Cache[T]) doPromote(item *Item[T]) bool {
-	// already deleted
-	if item.promotions == -2 {
-		return false
-	}
-
-	if item.inList {
-		if item.shouldPromote(c.getsPerPromote) {
-			c.list.MoveToFront(item)
-			item.promotions = 0
-		}
-		return false
-	}
-
-	c.size += item.size
-	c.list.Insert(item)
-	return true
+	return promoteItem(item, c.list, &c.size, c.getsPerPromote)
 }
 
 func (c *Cache[T]) gc() int {
@@ -377,15 +354,9 @@ func (c *Cache[T]) gc() int {
 		if !c.tracking || atomic.LoadInt32(&item.refCount) == 0 {
 			c.bucket(item.key).delete(item.key)
 			itemSize := item.size
-			c.size -= itemSize
 			prunedSize += itemSize
-
-			c.list.Remove(item)
-			if c.onDelete != nil {
-				c.onDelete(item)
-			}
+			retireItem(item, c.list, &c.size, c.onDelete)
 			dropped += 1
-			item.promotions = -2
 		}
 		item = prev
 	}

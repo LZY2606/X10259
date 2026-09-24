@@ -46,6 +46,7 @@ func Layered[T any](config *Configuration[T]) *LayeredCache[T] {
 	for i := 0; i < config.buckets; i++ {
 		c.buckets[i] = &layeredBucket[T]{
 			buckets: make(map[string]*bucket[T]),
+			now:     config.now,
 		}
 	}
 	go c.worker()
@@ -69,7 +70,7 @@ func (c *LayeredCache[T]) Get(primary, secondary string) *Item[T] {
 	if item == nil {
 		return nil
 	}
-	if item.expires > time.Now().UnixNano() {
+	if item.expires > c.now().UnixNano() {
 		select {
 		case c.promotables <- item:
 		default:
@@ -97,7 +98,7 @@ func (c *LayeredCache[T]) GetOrCreateSecondaryCache(primary string) *SecondaryCa
 	bkt := primaryBkt.getSecondaryBucket(primary)
 	primaryBkt.Lock()
 	if bkt == nil {
-		bkt = &bucket[T]{lookup: make(map[string]*Item[T])}
+		bkt = &bucket[T]{lookup: make(map[string]*Item[T]), now: c.now}
 		primaryBkt.buckets[primary] = bkt
 	}
 	primaryBkt.Unlock()
@@ -293,35 +294,11 @@ drain:
 }
 
 func (c *LayeredCache[T]) doDelete(item *Item[T]) {
-	if !item.inList {
-		item.promotions = -2
-	} else {
-		c.size -= item.size
-		if c.onDelete != nil {
-			c.onDelete(item)
-		}
-		c.list.Remove(item)
-		item.promotions = -2
-	}
+	retireItem(item, c.list, &c.size, c.onDelete)
 }
 
 func (c *LayeredCache[T]) doPromote(item *Item[T]) bool {
-	// deleted before it ever got promoted
-	if item.promotions == -2 {
-		return false
-	}
-
-	if item.inList {
-		if item.shouldPromote(c.getsPerPromote) {
-			c.list.MoveToFront(item)
-			item.promotions = 0
-		}
-		return false
-	}
-
-	c.size += item.size
-	c.list.Insert(item)
-	return true
+	return promoteItem(item, c.list, &c.size, c.getsPerPromote)
 }
 
 func (c *LayeredCache[T]) gc() int {
@@ -340,15 +317,9 @@ func (c *LayeredCache[T]) gc() int {
 
 			c.bucket(item.group).delete(item.group, item.key)
 			itemSize := item.size
-			c.size -= itemSize
 			prunedSize += itemSize
-
-			c.list.Remove(item)
-			if c.onDelete != nil {
-				c.onDelete(item)
-			}
+			retireItem(item, c.list, &c.size, c.onDelete)
 			dropped += 1
-			item.promotions = -2
 		}
 		item = prev
 	}
