@@ -259,14 +259,19 @@ func (c *Cache[T]) worker() {
 				}
 				msg.done <- struct{}{}
 			case controlClear:
+				// Items already queued for deletion must still go through
+				// the state machine: dropping the message would strand them
+				// in their current state and lose the onDelete ownership
+				// transfer. This runs before the halt so callbacks never
+				// fire while bucket locks are held.
+				deletables := c.deletables
+				for len(deletables) > 0 {
+					c.doDelete(<-deletables)
+				}
 				c.halted(func() {
 					promotables := c.promotables
 					for len(promotables) > 0 {
 						<-promotables
-					}
-					deletables := c.deletables
-					for len(deletables) > 0 {
-						<-deletables
 					}
 
 					for _, bucket := range c.buckets {
@@ -331,35 +336,11 @@ doAllDeletes:
 }
 
 func (c *Cache[T]) doDelete(item *Item[T]) {
-	if !item.inList {
-		item.promotions = -2
-	} else {
-		c.size -= item.size
-		if c.onDelete != nil {
-			c.onDelete(item)
-		}
-		c.list.Remove(item)
-		item.promotions = -2
-	}
+	removeItem(c.list, &c.size, item, c.onDelete)
 }
 
 func (c *Cache[T]) doPromote(item *Item[T]) bool {
-	// already deleted
-	if item.promotions == -2 {
-		return false
-	}
-
-	if item.inList {
-		if item.shouldPromote(c.getsPerPromote) {
-			c.list.MoveToFront(item)
-			item.promotions = 0
-		}
-		return false
-	}
-
-	c.size += item.size
-	c.list.Insert(item)
-	return true
+	return promoteItem(c.list, &c.size, item, c.getsPerPromote)
 }
 
 func (c *Cache[T]) gc() int {
@@ -377,15 +358,9 @@ func (c *Cache[T]) gc() int {
 		if !c.tracking || atomic.LoadInt32(&item.refCount) == 0 {
 			c.bucket(item.key).delete(item.key)
 			itemSize := item.size
-			c.size -= itemSize
 			prunedSize += itemSize
-
-			c.list.Remove(item)
-			if c.onDelete != nil {
-				c.onDelete(item)
-			}
+			removeItem(c.list, &c.size, item, c.onDelete)
 			dropped += 1
-			item.promotions = -2
 		}
 		item = prev
 	}

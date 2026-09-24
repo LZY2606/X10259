@@ -69,7 +69,7 @@ func (c *LayeredCache[T]) Get(primary, secondary string) *Item[T] {
 	if item == nil {
 		return nil
 	}
-	if item.expires > time.Now().UnixNano() {
+	if !item.Expired() {
 		select {
 		case c.promotables <- item:
 		default:
@@ -252,13 +252,17 @@ func (c *LayeredCache[T]) worker() {
 				}
 				msg.done <- struct{}{}
 			case controlClear:
+				// See Cache: queued deletions must transition through the
+				// state machine (and keep their callback ownership) rather
+				// than being silently dropped. Done before the halt so the
+				// callbacks never run while bucket locks are held.
+				deletables := c.deletables
+				for len(deletables) > 0 {
+					c.doDelete(<-deletables)
+				}
 				promotables := c.promotables
 				for len(promotables) > 0 {
 					<-promotables
-				}
-				deletables := c.deletables
-				for len(deletables) > 0 {
-					<-deletables
 				}
 
 				c.halted(func() {
@@ -293,35 +297,11 @@ drain:
 }
 
 func (c *LayeredCache[T]) doDelete(item *Item[T]) {
-	if !item.inList {
-		item.promotions = -2
-	} else {
-		c.size -= item.size
-		if c.onDelete != nil {
-			c.onDelete(item)
-		}
-		c.list.Remove(item)
-		item.promotions = -2
-	}
+	removeItem(c.list, &c.size, item, c.onDelete)
 }
 
 func (c *LayeredCache[T]) doPromote(item *Item[T]) bool {
-	// deleted before it ever got promoted
-	if item.promotions == -2 {
-		return false
-	}
-
-	if item.inList {
-		if item.shouldPromote(c.getsPerPromote) {
-			c.list.MoveToFront(item)
-			item.promotions = 0
-		}
-		return false
-	}
-
-	c.size += item.size
-	c.list.Insert(item)
-	return true
+	return promoteItem(c.list, &c.size, item, c.getsPerPromote)
 }
 
 func (c *LayeredCache[T]) gc() int {
@@ -340,15 +320,9 @@ func (c *LayeredCache[T]) gc() int {
 
 			c.bucket(item.group).delete(item.group, item.key)
 			itemSize := item.size
-			c.size -= itemSize
 			prunedSize += itemSize
-
-			c.list.Remove(item)
-			if c.onDelete != nil {
-				c.onDelete(item)
-			}
+			removeItem(c.list, &c.size, item, c.onDelete)
 			dropped += 1
-			item.promotions = -2
 		}
 		item = prev
 	}
