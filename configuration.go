@@ -1,5 +1,7 @@
 package ccache
 
+import "time"
+
 type Configuration[T any] struct {
 	maxSize        int64
 	buckets        int
@@ -9,6 +11,8 @@ type Configuration[T any] struct {
 	getsPerPromote int32
 	tracking       bool
 	onDelete       func(item *Item[T])
+	now            clockFunc
+	workerBarrier  workerGate
 }
 
 // Creates a configuration object with sensible defaults
@@ -23,6 +27,8 @@ func Configure[T any]() *Configuration[T] {
 		promoteBuffer:  1024,
 		maxSize:        5000,
 		tracking:       false,
+		now:            time.Now,
+		workerBarrier:  openGate{},
 	}
 }
 

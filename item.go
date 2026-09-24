@@ -19,11 +19,48 @@ type TrackedItem[T any] interface {
 	Extend(duration time.Duration)
 }
 
+// itemState is the single source of truth for who owns an Item.
+//
+// An item is transferred between three owners as it moves through the cache:
+//   - stateQueued:    the item exists in a bucket's lookup map (and possibly in
+//                     the promotables/deletables queues), but has never been
+//                     accounted for in the cache size or the recency list.
+//   - statePromoted:  the item is owned by the recency list, is counted in the
+//                     cache size and is eligible for LRU eviction.
+//   - stateDeleted:  terminal state. The item is not counted, not listed and
+//                     must never come back, regardless of any promotion or
+//                     deletion event still draining from a queue.
+//
+// Every state transition happens on the single worker goroutine through
+// lifecycle.applyPromote/lifecycle.applyDelete/lifecycle.gc, which makes the
+// bucket -> promotables -> list -> deletables ownership transfer a single,
+// inspectable state machine.
+type itemState int32
+
+const (
+	stateQueued itemState = iota
+	statePromoted
+	stateDeleted
+)
+
+func (s itemState) String() string {
+	switch s {
+	case stateQueued:
+		return "queued"
+	case statePromoted:
+		return "promoted"
+	case stateDeleted:
+		return "deleted"
+	}
+	return "unknown"
+}
+
 type Item[T any] struct {
 	key        string
 	group      string
 	promotions int32
 	refCount   int32
+	state      int32
 	expires    int64
 	size       int64
 	value      T
@@ -51,6 +88,23 @@ func newItem[T any](key string, value T, expires int64, track bool) *Item[T] {
 		item.refCount = 1
 	}
 	return item
+}
+
+// ownerState reports the item's current ownership state.
+func (i *Item[T]) ownerState() itemState {
+	return itemState(atomic.LoadInt32(&i.state))
+}
+
+// transitionTo moves the item to a new ownership state.
+func (i *Item[T]) transitionTo(state itemState) {
+	atomic.StoreInt32(&i.state, int32(state))
+}
+
+// expiredAt reports whether the item had already expired at the given instant
+// (in nanoseconds). Expiry is an absolute timestamp, so an expired item can
+// never become valid again.
+func (i *Item[T]) expiredAt(nowNanos int64) bool {
+	return atomic.LoadInt64(&i.expires) < nowNanos
 }
 
 func (i *Item[T]) shouldPromote(getsPerPromote int32) bool {
