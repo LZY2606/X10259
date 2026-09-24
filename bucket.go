@@ -43,7 +43,7 @@ func (b *bucket[T]) setnx(key string, value T, duration time.Duration, track boo
 		return item
 	}
 
-	expires := time.Now().Add(duration).UnixNano()
+	expires := now().Add(duration).UnixNano()
 	newItem := newItem(key, value, expires, track)
 
 	b.Lock()
@@ -76,7 +76,7 @@ func (b *bucket[T]) setnx2(key string, f func() T, duration time.Duration, track
 		return item, true
 	}
 
-	expires := time.Now().Add(duration).UnixNano()
+	expires := now().Add(duration).UnixNano()
 	newItem := newItem(key, f(), expires, track)
 
 	b.lookup[key] = newItem
@@ -84,7 +84,7 @@ func (b *bucket[T]) setnx2(key string, f func() T, duration time.Duration, track
 }
 
 func (b *bucket[T]) set(key string, value T, duration time.Duration, track bool) (*Item[T], *Item[T]) {
-	expires := time.Now().Add(duration).UnixNano()
+	expires := now().Add(duration).UnixNano()
 	item := newItem(key, value, expires, track)
 	b.Lock()
 	existing := b.lookup[key]
@@ -104,6 +104,18 @@ func (b *bucket[T]) remove(key string) *Item[T] {
 func (b *bucket[T]) delete(key string) {
 	b.Lock()
 	delete(b.lookup, key)
+	b.Unlock()
+}
+
+// deleteItem removes the key only if the bucket still holds this exact item.
+// A newer item may have overwritten the key while the evicted item was
+// waiting in the deletables queue; blindly deleting the key would drop the
+// live replacement from the bucket while it remains in the LRU list.
+func (b *bucket[T]) deleteItem(key string, item *Item[T]) {
+	b.Lock()
+	if b.lookup[key] == item {
+		delete(b.lookup, key)
+	}
 	b.Unlock()
 }
 
@@ -155,7 +167,7 @@ func (b *bucket[T]) deletePrefix(prefix string, deletables chan *Item[T]) int {
 // we expect the caller to have acquired a write lock
 func (b *bucket[T]) clear() {
 	for _, item := range b.lookup {
-		item.promotions = -2
+		item.markDeleted()
 	}
 	b.lookup = make(map[string]*Item[T])
 }

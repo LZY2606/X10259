@@ -71,6 +71,18 @@ func (b *layeredBucket[T]) delete(primary, secondary string) {
 	bucket.delete(secondary)
 }
 
+// deleteItem removes the secondary key only if the bucket still holds this
+// exact item. See bucket.deleteItem for why the identity check matters.
+func (b *layeredBucket[T]) deleteItem(primary, secondary string, item *Item[T]) {
+	b.RLock()
+	bucket, exists := b.buckets[primary]
+	b.RUnlock()
+	if !exists {
+		return
+	}
+	bucket.deleteItem(secondary, item)
+}
+
 func (b *layeredBucket[T]) deletePrefix(primary, prefix string, deletables chan *Item[T]) int {
 	b.RLock()
 	bucket, exists := b.buckets[primary]

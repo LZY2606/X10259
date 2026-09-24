@@ -69,7 +69,7 @@ func (c *LayeredCache[T]) Get(primary, secondary string) *Item[T] {
 	if item == nil {
 		return nil
 	}
-	if item.expires > time.Now().UnixNano() {
+	if item.expires > now().UnixNano() {
 		select {
 		case c.promotables <- item:
 		default:
@@ -293,25 +293,24 @@ drain:
 }
 
 func (c *LayeredCache[T]) doDelete(item *Item[T]) {
-	if !item.inList {
-		item.promotions = -2
-	} else {
-		c.size -= item.size
-		if c.onDelete != nil {
-			c.onDelete(item)
-		}
-		c.list.Remove(item)
-		item.promotions = -2
+	if !item.markDeleted() {
+		return
 	}
+	c.size -= item.size
+	if c.onDelete != nil {
+		c.onDelete(item)
+	}
+	c.list.Remove(item)
 }
 
 func (c *LayeredCache[T]) doPromote(item *Item[T]) bool {
-	// deleted before it ever got promoted
-	if item.promotions == -2 {
+	// deleted (or cleared) before it ever got promoted; a late promotion
+	// must not resurrect it
+	if item.isDeleted() {
 		return false
 	}
 
-	if item.inList {
+	if item.state == stateListed {
 		if item.shouldPromote(c.getsPerPromote) {
 			c.list.MoveToFront(item)
 			item.promotions = 0
@@ -319,6 +318,7 @@ func (c *LayeredCache[T]) doPromote(item *Item[T]) bool {
 		return false
 	}
 
+	item.state = stateListed
 	c.size += item.size
 	c.list.Insert(item)
 	return true
@@ -338,7 +338,7 @@ func (c *LayeredCache[T]) gc() int {
 		prev := item.prev
 		if !c.tracking || atomic.LoadInt32(&item.refCount) == 0 {
 
-			c.bucket(item.group).delete(item.group, item.key)
+			c.bucket(item.group).deleteItem(item.group, item.key, item)
 			itemSize := item.size
 			c.size -= itemSize
 			prunedSize += itemSize
@@ -348,7 +348,7 @@ func (c *LayeredCache[T]) gc() int {
 				c.onDelete(item)
 			}
 			dropped += 1
-			item.promotions = -2
+			item.markDeleted()
 		}
 		item = prev
 	}

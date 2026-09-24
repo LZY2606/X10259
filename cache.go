@@ -331,25 +331,25 @@ doAllDeletes:
 }
 
 func (c *Cache[T]) doDelete(item *Item[T]) {
-	if !item.inList {
-		item.promotions = -2
-	} else {
-		c.size -= item.size
-		if c.onDelete != nil {
-			c.onDelete(item)
-		}
-		c.list.Remove(item)
-		item.promotions = -2
+	if !item.markDeleted() {
+		return
 	}
+	c.size -= item.size
+	if c.onDelete != nil {
+		c.onDelete(item)
+	}
+	c.list.Remove(item)
 }
 
 func (c *Cache[T]) doPromote(item *Item[T]) bool {
-	// already deleted
-	if item.promotions == -2 {
+	// A deleted item must never be (re-)promoted: a delete or Clear that
+	// overtook this promotion has already retired it, and a late promotion
+	// must not resurrect it.
+	if item.isDeleted() {
 		return false
 	}
 
-	if item.inList {
+	if item.state == stateListed {
 		if item.shouldPromote(c.getsPerPromote) {
 			c.list.MoveToFront(item)
 			item.promotions = 0
@@ -357,6 +357,7 @@ func (c *Cache[T]) doPromote(item *Item[T]) bool {
 		return false
 	}
 
+	item.state = stateListed
 	c.size += item.size
 	c.list.Insert(item)
 	return true
@@ -375,7 +376,7 @@ func (c *Cache[T]) gc() int {
 		}
 		prev := item.prev
 		if !c.tracking || atomic.LoadInt32(&item.refCount) == 0 {
-			c.bucket(item.key).delete(item.key)
+			c.bucket(item.key).deleteItem(item.key, item)
 			itemSize := item.size
 			c.size -= itemSize
 			prunedSize += itemSize
@@ -385,7 +386,7 @@ func (c *Cache[T]) gc() int {
 				c.onDelete(item)
 			}
 			dropped += 1
-			item.promotions = -2
+			item.markDeleted()
 		}
 		item = prev
 	}
