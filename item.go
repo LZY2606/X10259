@@ -19,10 +19,34 @@ type TrackedItem[T any] interface {
 	Extend(duration time.Duration)
 }
 
+// Item lifecycle states. An item moves through a single ownership state
+// machine as it travels between its bucket, the promotables queue, the LRU
+// list and the delete queue:
+//
+//	live (unlisted) --promotables--> live (listed) --deletables--> dead
+//
+//   - An item is born "live" when Set/Setnx/Setnx2 stores it in a bucket.
+//     It is owned by that bucket and is visible to Get.
+//   - The worker's promote path moves a live item into the LRU list. An
+//     item that expired (or died) while its promotion was still queued is
+//     dropped instead: a late promotion never revives it.
+//   - Delete, overwrite, GC and Clear transfer ownership to the delete
+//     path. finalize performs the live->dead transition exactly once; the
+//     winner alone accounts the size and runs the onDelete callback (for
+//     listed items), so the callback fires at most once per item and never
+//     while holding a bucket lock.
+//   - A dead item can never re-enter the list: late promotions and duplicate
+//     deletes are no-ops.
+const (
+	itemLive int32 = iota
+	itemDead
+)
+
 type Item[T any] struct {
 	key        string
 	group      string
 	promotions int32
+	state      int32
 	refCount   int32
 	expires    int64
 	size       int64
@@ -58,6 +82,18 @@ func (i *Item[T]) shouldPromote(getsPerPromote int32) bool {
 	return i.promotions == getsPerPromote
 }
 
+// finalize atomically moves the item from live to dead, reporting whether
+// the caller won the transition. Exactly one caller observes true, which is
+// what guarantees exactly-once ownership of the delete path (size accounting
+// and the onDelete callback).
+func (i *Item[T]) finalize() bool {
+	return atomic.CompareAndSwapInt32(&i.state, itemLive, itemDead)
+}
+
+func (i *Item[T]) isDead() bool {
+	return atomic.LoadInt32(&i.state) == itemDead
+}
+
 func (i *Item[T]) Key() string {
 	return i.key
 }
@@ -76,12 +112,12 @@ func (i *Item[T]) Release() {
 
 func (i *Item[T]) Expired() bool {
 	expires := atomic.LoadInt64(&i.expires)
-	return expires < time.Now().UnixNano()
+	return expires < timeNow().UnixNano()
 }
 
 func (i *Item[T]) TTL() time.Duration {
 	expires := atomic.LoadInt64(&i.expires)
-	return time.Nanosecond * time.Duration(expires-time.Now().UnixNano())
+	return time.Nanosecond * time.Duration(expires-timeNow().UnixNano())
 }
 
 func (i *Item[T]) Expires() time.Time {
@@ -90,7 +126,7 @@ func (i *Item[T]) Expires() time.Time {
 }
 
 func (i *Item[T]) Extend(duration time.Duration) {
-	atomic.StoreInt64(&i.expires, time.Now().Add(duration).UnixNano())
+	atomic.StoreInt64(&i.expires, timeNow().Add(duration).UnixNano())
 }
 
 // String returns a string representation of the Item. This includes the default string

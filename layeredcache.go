@@ -17,6 +17,13 @@ type LayeredCache[T any] struct {
 	pruneTargetSize int64
 	deletables      chan *Item[T]
 	promotables     chan *Item[T]
+	flights         flightGroup[layeredKey, T]
+}
+
+// layeredKey identifies a value in a LayeredCache for single-flight purposes.
+type layeredKey struct {
+	primary   string
+	secondary string
 }
 
 // Create a new layered cache with the specified configuration.
@@ -69,7 +76,7 @@ func (c *LayeredCache[T]) Get(primary, secondary string) *Item[T] {
 	if item == nil {
 		return nil
 	}
-	if item.expires > time.Now().UnixNano() {
+	if item.expires > timeNow().UnixNano() {
 		select {
 		case c.promotables <- item:
 		default:
@@ -143,19 +150,24 @@ func (c *LayeredCache[T]) Replace(primary, secondary string, value T) bool {
 // Attempts to get the value from the cache and calles fetch on a miss.
 // If fetch returns an error, no value is cached and the error is returned back
 // to the caller.
-// Note that Fetch merely calls the public Get and Set functions. If you want
-// a different Fetch behavior, such as thundering herd protection or returning
-// expired items, implement it in your application.
+// Concurrent Fetch calls for the same (primary, secondary) pair are
+// single-flighted: only one goroutine runs fetch and the others share its
+// result. A failed fetch leaves no cached value or in-flight state behind.
 func (c *LayeredCache[T]) Fetch(primary, secondary string, duration time.Duration, fetch func() (T, error)) (*Item[T], error) {
 	item := c.Get(primary, secondary)
 	if item != nil {
 		return item, nil
 	}
-	value, err := fetch()
-	if err != nil {
-		return nil, err
-	}
-	return c.set(primary, secondary, value, duration, false), nil
+	return c.flights.do(layeredKey{primary, secondary}, func() (*Item[T], error) {
+		if item := c.Get(primary, secondary); item != nil {
+			return item, nil
+		}
+		value, err := fetch()
+		if err != nil {
+			return nil, err
+		}
+		return c.set(primary, secondary, value, duration, false), nil
+	})
 }
 
 // Remove the item from the cache, return true if the item was present, false otherwise.
@@ -254,11 +266,11 @@ func (c *LayeredCache[T]) worker() {
 			case controlClear:
 				promotables := c.promotables
 				for len(promotables) > 0 {
-					<-promotables
+					(<-promotables).finalize()
 				}
 				deletables := c.deletables
 				for len(deletables) > 0 {
-					<-deletables
+					(<-deletables).finalize()
 				}
 
 				c.halted(func() {
@@ -293,21 +305,23 @@ drain:
 }
 
 func (c *LayeredCache[T]) doDelete(item *Item[T]) {
-	if !item.inList {
-		item.promotions = -2
-	} else {
-		c.size -= item.size
-		if c.onDelete != nil {
-			c.onDelete(item)
-		}
-		c.list.Remove(item)
-		item.promotions = -2
+	if !item.finalize() {
+		return
 	}
+	if !item.inList {
+		return
+	}
+	c.size -= item.size
+	if c.onDelete != nil {
+		c.onDelete(item)
+	}
+	c.list.Remove(item)
 }
 
 func (c *LayeredCache[T]) doPromote(item *Item[T]) bool {
-	// deleted before it ever got promoted
-	if item.promotions == -2 {
+	// deleted before it ever got promoted: a late promotion must not
+	// revive a dead item
+	if item.isDead() {
 		return false
 	}
 
@@ -316,6 +330,12 @@ func (c *LayeredCache[T]) doPromote(item *Item[T]) bool {
 			c.list.MoveToFront(item)
 			item.promotions = 0
 		}
+		return false
+	}
+
+	// an item that expired while its promotion was queued is dropped
+	// rather than inserted into the LRU list
+	if item.Expired() {
 		return false
 	}
 
@@ -338,7 +358,7 @@ func (c *LayeredCache[T]) gc() int {
 		prev := item.prev
 		if !c.tracking || atomic.LoadInt32(&item.refCount) == 0 {
 
-			c.bucket(item.group).delete(item.group, item.key)
+			c.bucket(item.group).deleteIfSame(item.group, item.key, item)
 			itemSize := item.size
 			c.size -= itemSize
 			prunedSize += itemSize
@@ -348,7 +368,7 @@ func (c *LayeredCache[T]) gc() int {
 				c.onDelete(item)
 			}
 			dropped += 1
-			item.promotions = -2
+			item.finalize()
 		}
 		item = prev
 	}

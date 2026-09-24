@@ -71,6 +71,19 @@ func (b *layeredBucket[T]) delete(primary, secondary string) {
 	bucket.delete(secondary)
 }
 
+// deleteIfSame removes the secondary key only if the bucket still holds the
+// exact item passed in, so that GC of a stale list entry cannot delete the
+// newer item now owning the key.
+func (b *layeredBucket[T]) deleteIfSame(primary, secondary string, item *Item[T]) {
+	b.RLock()
+	bucket, exists := b.buckets[primary]
+	b.RUnlock()
+	if !exists {
+		return
+	}
+	bucket.deleteIfSame(secondary, item)
+}
+
 func (b *layeredBucket[T]) deletePrefix(primary, prefix string, deletables chan *Item[T]) int {
 	b.RLock()
 	bucket, exists := b.buckets[primary]

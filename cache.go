@@ -17,6 +17,7 @@ type Cache[T any] struct {
 	bucketMask      uint32
 	deletables      chan *Item[T]
 	promotables     chan *Item[T]
+	flights         flightGroup[string, T]
 }
 
 // Create a new cache with the specified configuration
@@ -169,19 +170,27 @@ func (c *Cache[T]) Extend(key string, duration time.Duration) bool {
 // Attempts to get the value from the cache and calles fetch on a miss (missing
 // or stale item). If fetch returns an error, no value is cached and the error
 // is returned back to the caller.
-// Note that Fetch merely calls the public Get and Set functions. If you want
-// a different Fetch behavior, such as thundering herd protection or returning
-// expired items, implement it in your application.
+// Concurrent Fetch calls for the same key are single-flighted: only one
+// goroutine runs fetch and the others share its result. A failed fetch leaves
+// no cached value, in-flight state or size accounting behind, so retrying the
+// same call behaves exactly like a first attempt.
 func (c *Cache[T]) Fetch(key string, duration time.Duration, fetch func() (T, error)) (*Item[T], error) {
 	item := c.Get(key)
 	if item != nil && !item.Expired() {
 		return item, nil
 	}
-	value, err := fetch()
-	if err != nil {
-		return nil, err
-	}
-	return c.set(key, value, duration, false), nil
+	return c.flights.do(key, func() (*Item[T], error) {
+		// re-check under the flight: the key may have been populated while
+		// this goroutine was waiting to become the leader
+		if item := c.Get(key); item != nil && !item.Expired() {
+			return item, nil
+		}
+		value, err := fetch()
+		if err != nil {
+			return nil, err
+		}
+		return c.set(key, value, duration, false), nil
+	})
 }
 
 // Remove the item from the cache, return true if the item was present, false otherwise.
@@ -262,11 +271,11 @@ func (c *Cache[T]) worker() {
 				c.halted(func() {
 					promotables := c.promotables
 					for len(promotables) > 0 {
-						<-promotables
+						(<-promotables).finalize()
 					}
 					deletables := c.deletables
 					for len(deletables) > 0 {
-						<-deletables
+						(<-deletables).finalize()
 					}
 
 					for _, bucket := range c.buckets {
@@ -331,21 +340,25 @@ doAllDeletes:
 }
 
 func (c *Cache[T]) doDelete(item *Item[T]) {
-	if !item.inList {
-		item.promotions = -2
-	} else {
-		c.size -= item.size
-		if c.onDelete != nil {
-			c.onDelete(item)
-		}
-		c.list.Remove(item)
-		item.promotions = -2
+	// Exactly one delete-path caller wins the live->dead transition; any
+	// duplicate delete (Delete + DeleteFunc, delete + GC, ...) is a no-op.
+	if !item.finalize() {
+		return
 	}
+	if !item.inList {
+		return
+	}
+	c.size -= item.size
+	if c.onDelete != nil {
+		c.onDelete(item)
+	}
+	c.list.Remove(item)
 }
 
 func (c *Cache[T]) doPromote(item *Item[T]) bool {
-	// already deleted
-	if item.promotions == -2 {
+	// deleted before it ever got promoted: a late promotion must not
+	// revive a dead item
+	if item.isDead() {
 		return false
 	}
 
@@ -354,6 +367,12 @@ func (c *Cache[T]) doPromote(item *Item[T]) bool {
 			c.list.MoveToFront(item)
 			item.promotions = 0
 		}
+		return false
+	}
+
+	// an item that expired while its promotion was queued is dropped
+	// rather than inserted into the LRU list
+	if item.Expired() {
 		return false
 	}
 
@@ -375,7 +394,7 @@ func (c *Cache[T]) gc() int {
 		}
 		prev := item.prev
 		if !c.tracking || atomic.LoadInt32(&item.refCount) == 0 {
-			c.bucket(item.key).delete(item.key)
+			c.bucket(item.key).deleteIfSame(item.key, item)
 			itemSize := item.size
 			c.size -= itemSize
 			prunedSize += itemSize
@@ -385,7 +404,7 @@ func (c *Cache[T]) gc() int {
 				c.onDelete(item)
 			}
 			dropped += 1
-			item.promotions = -2
+			item.finalize()
 		}
 		item = prev
 	}
