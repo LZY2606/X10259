@@ -9,6 +9,14 @@ import (
 type bucket[T any] struct {
 	sync.RWMutex
 	lookup map[string]*Item[T]
+	clock  func() time.Time
+}
+
+func (b *bucket[T]) now() time.Time {
+	if b.clock == nil {
+		return time.Now()
+	}
+	return b.clock()
 }
 
 func (b *bucket[T]) itemCount() int {
@@ -43,8 +51,9 @@ func (b *bucket[T]) setnx(key string, value T, duration time.Duration, track boo
 		return item
 	}
 
-	expires := time.Now().Add(duration).UnixNano()
+	expires := b.now().Add(duration).UnixNano()
 	newItem := newItem(key, value, expires, track)
+	newItem.clock = b.clock
 
 	b.Lock()
 	defer b.Unlock()
@@ -76,16 +85,18 @@ func (b *bucket[T]) setnx2(key string, f func() T, duration time.Duration, track
 		return item, true
 	}
 
-	expires := time.Now().Add(duration).UnixNano()
+	expires := b.now().Add(duration).UnixNano()
 	newItem := newItem(key, f(), expires, track)
+	newItem.clock = b.clock
 
 	b.lookup[key] = newItem
 	return newItem, false
 }
 
 func (b *bucket[T]) set(key string, value T, duration time.Duration, track bool) (*Item[T], *Item[T]) {
-	expires := time.Now().Add(duration).UnixNano()
+	expires := b.now().Add(duration).UnixNano()
 	item := newItem(key, value, expires, track)
+	item.clock = b.clock
 	b.Lock()
 	existing := b.lookup[key]
 	b.lookup[key] = item
@@ -155,7 +166,7 @@ func (b *bucket[T]) deletePrefix(prefix string, deletables chan *Item[T]) int {
 // we expect the caller to have acquired a write lock
 func (b *bucket[T]) clear() {
 	for _, item := range b.lookup {
-		item.promotions = -2
+		abandonItem(item)
 	}
 	b.lookup = make(map[string]*Item[T])
 }

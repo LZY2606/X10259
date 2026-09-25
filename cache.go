@@ -35,6 +35,7 @@ func New[T any](config *Configuration[T]) *Cache[T] {
 	for i := 0; i < config.buckets; i++ {
 		c.buckets[i] = &bucket[T]{
 			lookup: make(map[string]*Item[T]),
+			clock:  config.clock,
 		}
 	}
 	go c.worker()
@@ -262,11 +263,11 @@ func (c *Cache[T]) worker() {
 				c.halted(func() {
 					promotables := c.promotables
 					for len(promotables) > 0 {
-						<-promotables
+						abandonItem(<-promotables)
 					}
 					deletables := c.deletables
 					for len(deletables) > 0 {
-						<-deletables
+						abandonItem(<-deletables)
 					}
 
 					for _, bucket := range c.buckets {
@@ -331,35 +332,20 @@ doAllDeletes:
 }
 
 func (c *Cache[T]) doDelete(item *Item[T]) {
-	if !item.inList {
-		item.promotions = -2
-	} else {
+	if deleteItem(c.list, item) == effectFireOnDelete {
 		c.size -= item.size
 		if c.onDelete != nil {
 			c.onDelete(item)
 		}
-		c.list.Remove(item)
-		item.promotions = -2
 	}
 }
 
 func (c *Cache[T]) doPromote(item *Item[T]) bool {
-	// already deleted
-	if item.promotions == -2 {
-		return false
+	if promoteItem(c.list, item, c.getsPerPromote) == effectEnteredList {
+		c.size += item.size
+		return true
 	}
-
-	if item.inList {
-		if item.shouldPromote(c.getsPerPromote) {
-			c.list.MoveToFront(item)
-			item.promotions = 0
-		}
-		return false
-	}
-
-	c.size += item.size
-	c.list.Insert(item)
-	return true
+	return false
 }
 
 func (c *Cache[T]) gc() int {
@@ -380,12 +366,10 @@ func (c *Cache[T]) gc() int {
 			c.size -= itemSize
 			prunedSize += itemSize
 
-			c.list.Remove(item)
-			if c.onDelete != nil {
+			if deleteItem(c.list, item) == effectFireOnDelete && c.onDelete != nil {
 				c.onDelete(item)
 			}
 			dropped += 1
-			item.promotions = -2
 		}
 		item = prev
 	}

@@ -30,6 +30,8 @@ type Item[T any] struct {
 	next       *Item[T]
 	prev       *Item[T]
 	inList     bool
+	state      itemState
+	clock      func() time.Time
 }
 
 func newItem[T any](key string, value T, expires int64, track bool) *Item[T] {
@@ -58,6 +60,17 @@ func (i *Item[T]) shouldPromote(getsPerPromote int32) bool {
 	return i.promotions == getsPerPromote
 }
 
+// now reports the current time from the item's clock. Items created through
+// a cache inherit the cache's configured clock (production uses time.Now;
+// tests can substitute a fake clock at configuration time). The nil fallback
+// keeps zero-value Items, which some package tests build directly, usable.
+func (i *Item[T]) now() time.Time {
+	if i.clock == nil {
+		return time.Now()
+	}
+	return i.clock()
+}
+
 func (i *Item[T]) Key() string {
 	return i.key
 }
@@ -76,12 +89,12 @@ func (i *Item[T]) Release() {
 
 func (i *Item[T]) Expired() bool {
 	expires := atomic.LoadInt64(&i.expires)
-	return expires < time.Now().UnixNano()
+	return expires < i.now().UnixNano()
 }
 
 func (i *Item[T]) TTL() time.Duration {
 	expires := atomic.LoadInt64(&i.expires)
-	return time.Nanosecond * time.Duration(expires-time.Now().UnixNano())
+	return time.Nanosecond * time.Duration(expires-i.now().UnixNano())
 }
 
 func (i *Item[T]) Expires() time.Time {
@@ -90,7 +103,7 @@ func (i *Item[T]) Expires() time.Time {
 }
 
 func (i *Item[T]) Extend(duration time.Duration) {
-	atomic.StoreInt64(&i.expires, time.Now().Add(duration).UnixNano())
+	atomic.StoreInt64(&i.expires, i.now().Add(duration).UnixNano())
 }
 
 // String returns a string representation of the Item. This includes the default string

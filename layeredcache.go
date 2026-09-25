@@ -46,6 +46,7 @@ func Layered[T any](config *Configuration[T]) *LayeredCache[T] {
 	for i := 0; i < config.buckets; i++ {
 		c.buckets[i] = &layeredBucket[T]{
 			buckets: make(map[string]*bucket[T]),
+			clock:   config.clock,
 		}
 	}
 	go c.worker()
@@ -69,7 +70,7 @@ func (c *LayeredCache[T]) Get(primary, secondary string) *Item[T] {
 	if item == nil {
 		return nil
 	}
-	if item.expires > time.Now().UnixNano() {
+	if !item.Expired() {
 		select {
 		case c.promotables <- item:
 		default:
@@ -97,7 +98,7 @@ func (c *LayeredCache[T]) GetOrCreateSecondaryCache(primary string) *SecondaryCa
 	bkt := primaryBkt.getSecondaryBucket(primary)
 	primaryBkt.Lock()
 	if bkt == nil {
-		bkt = &bucket[T]{lookup: make(map[string]*Item[T])}
+		bkt = &bucket[T]{lookup: make(map[string]*Item[T]), clock: primaryBkt.clock}
 		primaryBkt.buckets[primary] = bkt
 	}
 	primaryBkt.Unlock()
@@ -254,11 +255,11 @@ func (c *LayeredCache[T]) worker() {
 			case controlClear:
 				promotables := c.promotables
 				for len(promotables) > 0 {
-					<-promotables
+					abandonItem(<-promotables)
 				}
 				deletables := c.deletables
 				for len(deletables) > 0 {
-					<-deletables
+					abandonItem(<-deletables)
 				}
 
 				c.halted(func() {
@@ -293,35 +294,20 @@ drain:
 }
 
 func (c *LayeredCache[T]) doDelete(item *Item[T]) {
-	if !item.inList {
-		item.promotions = -2
-	} else {
+	if deleteItem(c.list, item) == effectFireOnDelete {
 		c.size -= item.size
 		if c.onDelete != nil {
 			c.onDelete(item)
 		}
-		c.list.Remove(item)
-		item.promotions = -2
 	}
 }
 
 func (c *LayeredCache[T]) doPromote(item *Item[T]) bool {
-	// deleted before it ever got promoted
-	if item.promotions == -2 {
-		return false
+	if promoteItem(c.list, item, c.getsPerPromote) == effectEnteredList {
+		c.size += item.size
+		return true
 	}
-
-	if item.inList {
-		if item.shouldPromote(c.getsPerPromote) {
-			c.list.MoveToFront(item)
-			item.promotions = 0
-		}
-		return false
-	}
-
-	c.size += item.size
-	c.list.Insert(item)
-	return true
+	return false
 }
 
 func (c *LayeredCache[T]) gc() int {
@@ -343,12 +329,10 @@ func (c *LayeredCache[T]) gc() int {
 			c.size -= itemSize
 			prunedSize += itemSize
 
-			c.list.Remove(item)
-			if c.onDelete != nil {
+			if deleteItem(c.list, item) == effectFireOnDelete && c.onDelete != nil {
 				c.onDelete(item)
 			}
 			dropped += 1
-			item.promotions = -2
 		}
 		item = prev
 	}

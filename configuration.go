@@ -1,5 +1,7 @@
 package ccache
 
+import "time"
+
 type Configuration[T any] struct {
 	maxSize        int64
 	buckets        int
@@ -9,6 +11,7 @@ type Configuration[T any] struct {
 	getsPerPromote int32
 	tracking       bool
 	onDelete       func(item *Item[T])
+	clock          func() time.Time
 }
 
 // Creates a configuration object with sensible defaults
@@ -23,7 +26,20 @@ func Configure[T any]() *Configuration[T] {
 		promoteBuffer:  1024,
 		maxSize:        5000,
 		tracking:       false,
+		clock:          time.Now,
 	}
+}
+
+// withClock overrides the time source used to compute and evaluate item
+// expiration. It is intentionally unexported: production caches always use
+// the real clock (set in Configure), while package tests can drive time with
+// a fake clock. There is no test-only code path - the configured clock is the
+// same value threaded through bucket.set -> newItem -> Item.Expired/TTL/
+// Extend and through the lifecycle state machine, so tests exercise the exact
+// production transitions.
+func (c *Configuration[T]) withClock(clock func() time.Time) *Configuration[T] {
+	c.clock = clock
+	return c
 }
 
 // The max size for the cache
