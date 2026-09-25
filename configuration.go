@@ -9,6 +9,7 @@ type Configuration[T any] struct {
 	getsPerPromote int32
 	tracking       bool
 	onDelete       func(item *Item[T])
+	clock          clock
 }
 
 // Creates a configuration object with sensible defaults
@@ -102,5 +103,16 @@ func (c *Configuration[T]) Track() *Configuration[T] {
 // cached object that require some kind of tear-down.
 func (c *Configuration[T]) OnDelete(callback func(item *Item[T])) *Configuration[T] {
 	c.onDelete = callback
+	return c
+}
+
+// withClock installs a custom clock used for all expiration decisions. It is
+// deliberately unexported: production caches always run on the real clock.
+// Tests use it to drive expiration deterministically through the public cache
+// API; the injected clock flows through the exact same production code paths
+// (bucket.set/setnx, Item.Expired/TTL/Extend, LayeredCache.Get), so behavior
+// under a fake clock is the same code that runs against wall time.
+func (c *Configuration[T]) withClock(clk clock) *Configuration[T] {
+	c.clock = clk
 	return c
 }

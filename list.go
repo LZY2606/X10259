@@ -26,7 +26,6 @@ func (l *List[T]) Remove(item *Item[T]) {
 	}
 	item.next = nil
 	item.prev = nil
-	item.inList = false
 }
 
 func (l *List[T]) MoveToFront(item *Item[T]) {
@@ -37,7 +36,6 @@ func (l *List[T]) MoveToFront(item *Item[T]) {
 func (l *List[T]) Insert(item *Item[T]) {
 	head := l.Head
 	l.Head = item
-	item.inList = true
 	if head == nil {
 		l.Tail = item
 		return

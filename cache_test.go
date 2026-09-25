@@ -513,7 +513,7 @@ func Test_ConcurrentClearAndSet(t *testing.T) {
 		// it can only sync what's been written to the buffers.
 		for i := 0; i < 10; i++ {
 			expectedCount := 0
-			if cache.list.Head != nil {
+			if cache.owner.list.Head != nil {
 				expectedCount = 1
 			}
 			actualCount := cache.ItemCount()

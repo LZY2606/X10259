@@ -10,8 +10,8 @@ import (
 type Cache[T any] struct {
 	*Configuration[T]
 	control
-	list            *List[T]
-	size            int64
+	owner           *itemOwner[T]
+	clock           clock
 	pruneTargetSize int64
 	buckets         []*bucket[T]
 	bucketMask      uint32
@@ -22,8 +22,10 @@ type Cache[T any] struct {
 // Create a new cache with the specified configuration
 // See ccache.Configure() for creating a configuration
 func New[T any](config *Configuration[T]) *Cache[T] {
+	clk := resolveClock(config.clock)
 	c := &Cache[T]{
-		list:            NewList[T](),
+		owner:           newItemOwner(config.getsPerPromote, config.onDelete),
+		clock:           clk,
 		Configuration:   config,
 		control:         newControl(),
 		bucketMask:      uint32(config.buckets) - 1,
@@ -35,6 +37,7 @@ func New[T any](config *Configuration[T]) *Cache[T] {
 	for i := 0; i < config.buckets; i++ {
 		c.buckets[i] = &bucket[T]{
 			lookup: make(map[string]*Item[T]),
+			clock:  clk,
 		}
 	}
 	go c.worker()
@@ -232,7 +235,7 @@ func (c *Cache[T]) worker() {
 	cc := c.control
 
 	promoteItem := func(item *Item[T]) {
-		if c.doPromote(item) && c.size > c.maxSize {
+		if c.owner.promote(item) && c.owner.size > c.maxSize {
 			dropped += c.gc()
 		}
 	}
@@ -242,7 +245,7 @@ func (c *Cache[T]) worker() {
 		case item := <-c.promotables:
 			promoteItem(item)
 		case item := <-c.deletables:
-			c.doDelete(item)
+			c.owner.delete(item)
 		case control := <-cc:
 			switch msg := control.(type) {
 			case controlStop:
@@ -254,7 +257,7 @@ func (c *Cache[T]) worker() {
 				newMaxSize := msg.size
 				c.maxSize = newMaxSize
 				c.pruneTargetSize = newMaxSize - newMaxSize*int64(c.percentToPrune)/100
-				if c.size > c.maxSize {
+				if c.owner.size > c.maxSize {
 					dropped += c.gc()
 				}
 				msg.done <- struct{}{}
@@ -272,17 +275,16 @@ func (c *Cache[T]) worker() {
 					for _, bucket := range c.buckets {
 						bucket.clear()
 					}
-					c.size = 0
-					c.list = NewList[T]()
+					c.owner.reset()
 				})
 				msg.done <- struct{}{}
 			case controlGetSize:
-				msg.res <- c.size
+				msg.res <- c.owner.size
 			case controlGC:
 				dropped += c.gc()
 				msg.done <- struct{}{}
 			case controlSyncUpdates:
-				doAllPendingPromotesAndDeletes(c.promotables, promoteItem, c.deletables, c.doDelete)
+				doAllPendingPromotesAndDeletes(c.promotables, promoteItem, c.deletables, c.owner.delete)
 				msg.done <- struct{}{}
 			}
 		}
@@ -292,7 +294,7 @@ drain:
 	for {
 		select {
 		case item := <-c.deletables:
-			c.doDelete(item)
+			c.owner.delete(item)
 		default:
 			return
 		}
@@ -330,44 +332,12 @@ doAllDeletes:
 	}
 }
 
-func (c *Cache[T]) doDelete(item *Item[T]) {
-	if !item.inList {
-		item.promotions = -2
-	} else {
-		c.size -= item.size
-		if c.onDelete != nil {
-			c.onDelete(item)
-		}
-		c.list.Remove(item)
-		item.promotions = -2
-	}
-}
-
-func (c *Cache[T]) doPromote(item *Item[T]) bool {
-	// already deleted
-	if item.promotions == -2 {
-		return false
-	}
-
-	if item.inList {
-		if item.shouldPromote(c.getsPerPromote) {
-			c.list.MoveToFront(item)
-			item.promotions = 0
-		}
-		return false
-	}
-
-	c.size += item.size
-	c.list.Insert(item)
-	return true
-}
-
 func (c *Cache[T]) gc() int {
 	dropped := 0
-	item := c.list.Tail
+	item := c.owner.list.Tail
 
 	prunedSize := int64(0)
-	sizeToPrune := c.size - c.pruneTargetSize
+	sizeToPrune := c.owner.size - c.pruneTargetSize
 
 	for prunedSize < sizeToPrune {
 		if item == nil {
@@ -376,16 +346,8 @@ func (c *Cache[T]) gc() int {
 		prev := item.prev
 		if !c.tracking || atomic.LoadInt32(&item.refCount) == 0 {
 			c.bucket(item.key).delete(item.key)
-			itemSize := item.size
-			c.size -= itemSize
-			prunedSize += itemSize
-
-			c.list.Remove(item)
-			if c.onDelete != nil {
-				c.onDelete(item)
-			}
+			prunedSize += c.owner.evict(item)
 			dropped += 1
-			item.promotions = -2
 		}
 		item = prev
 	}
