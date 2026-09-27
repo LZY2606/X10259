@@ -17,6 +17,7 @@ type Cache[T any] struct {
 	bucketMask      uint32
 	deletables      chan *Item[T]
 	promotables     chan *Item[T]
+	lifecycle       lifecycle[T]
 }
 
 // Create a new cache with the specified configuration
@@ -35,7 +36,15 @@ func New[T any](config *Configuration[T]) *Cache[T] {
 	for i := 0; i < config.buckets; i++ {
 		c.buckets[i] = &bucket[T]{
 			lookup: make(map[string]*Item[T]),
+			now:    config.now,
 		}
+	}
+	c.lifecycle = lifecycle[T]{
+		list:            c.list,
+		size:            &c.size,
+		getsPerPromote:  &config.getsPerPromote,
+		onDelete:        config.onDelete,
+		removeFromIndex: func(key string) { c.bucket(key).delete(key) },
 	}
 	go c.worker()
 	return c
@@ -232,7 +241,7 @@ func (c *Cache[T]) worker() {
 	cc := c.control
 
 	promoteItem := func(item *Item[T]) {
-		if c.doPromote(item) && c.size > c.maxSize {
+		if c.lifecycle.applyPromote(item) && c.size > c.maxSize {
 			dropped += c.gc()
 		}
 	}
@@ -242,7 +251,7 @@ func (c *Cache[T]) worker() {
 		case item := <-c.promotables:
 			promoteItem(item)
 		case item := <-c.deletables:
-			c.doDelete(item)
+			c.lifecycle.applyDelete(item)
 		case control := <-cc:
 			switch msg := control.(type) {
 			case controlStop:
@@ -259,22 +268,7 @@ func (c *Cache[T]) worker() {
 				}
 				msg.done <- struct{}{}
 			case controlClear:
-				c.halted(func() {
-					promotables := c.promotables
-					for len(promotables) > 0 {
-						<-promotables
-					}
-					deletables := c.deletables
-					for len(deletables) > 0 {
-						<-deletables
-					}
-
-					for _, bucket := range c.buckets {
-						bucket.clear()
-					}
-					c.size = 0
-					c.list = NewList[T]()
-				})
+				c.clearAll()
 				msg.done <- struct{}{}
 			case controlGetSize:
 				msg.res <- c.size
@@ -282,7 +276,7 @@ func (c *Cache[T]) worker() {
 				dropped += c.gc()
 				msg.done <- struct{}{}
 			case controlSyncUpdates:
-				doAllPendingPromotesAndDeletes(c.promotables, promoteItem, c.deletables, c.doDelete)
+				doAllPendingPromotesAndDeletes(c.promotables, promoteItem, c.deletables, c.lifecycle.applyDelete)
 				msg.done <- struct{}{}
 			}
 		}
@@ -292,7 +286,62 @@ drain:
 	for {
 		select {
 		case item := <-c.deletables:
-			c.doDelete(item)
+			c.lifecycle.applyDelete(item)
+		default:
+			return
+		}
+	}
+}
+
+// clearAll drains every queued transition and empties every lookup. The whole
+// operation runs while all bucket locks are held, so a concurrent Set/Delete
+// cannot insert a transition between the queue drain and the lookup reset: once
+// Clear returns, every item that was observable before it is retired and no
+// late promotion can bring it back.
+func (c *Cache[T]) clearAll() {
+	c.halted(func() {
+		drainChannel(c.promotables)
+		drainChannel(c.deletables)
+		for _, bucket := range c.buckets {
+			bucket.clear()
+		}
+		c.size = 0
+		c.list = NewList[T]()
+		c.lifecycle.list = c.list
+	})
+}
+
+func (c *Cache[T]) gc() int {
+	dropped := 0
+	item := c.list.Tail
+
+	prunedSize := int64(0)
+	sizeToPrune := c.size - c.pruneTargetSize
+
+	for prunedSize < sizeToPrune {
+		if item == nil {
+			return dropped
+		}
+		prev := item.prev
+		if !c.tracking || atomic.LoadInt32(&item.refCount) == 0 {
+			if c.lifecycle.evict(item) {
+				prunedSize += item.size
+				dropped += 1
+			}
+		}
+		item = prev
+	}
+	return dropped
+}
+
+// drainChannel discards every message currently buffered. It is called with
+// every bucket lock held (during Clear), so no producer can re-fill the
+// channels while buckets are being swept.
+func drainChannel[T any](ch chan *Item[T]) {
+	for {
+		select {
+		case item := <-ch:
+			item.retire()
 		default:
 			return
 		}
@@ -328,66 +377,4 @@ doAllDeletes:
 			break doAllDeletes
 		}
 	}
-}
-
-func (c *Cache[T]) doDelete(item *Item[T]) {
-	if !item.inList {
-		item.promotions = -2
-	} else {
-		c.size -= item.size
-		if c.onDelete != nil {
-			c.onDelete(item)
-		}
-		c.list.Remove(item)
-		item.promotions = -2
-	}
-}
-
-func (c *Cache[T]) doPromote(item *Item[T]) bool {
-	// already deleted
-	if item.promotions == -2 {
-		return false
-	}
-
-	if item.inList {
-		if item.shouldPromote(c.getsPerPromote) {
-			c.list.MoveToFront(item)
-			item.promotions = 0
-		}
-		return false
-	}
-
-	c.size += item.size
-	c.list.Insert(item)
-	return true
-}
-
-func (c *Cache[T]) gc() int {
-	dropped := 0
-	item := c.list.Tail
-
-	prunedSize := int64(0)
-	sizeToPrune := c.size - c.pruneTargetSize
-
-	for prunedSize < sizeToPrune {
-		if item == nil {
-			return dropped
-		}
-		prev := item.prev
-		if !c.tracking || atomic.LoadInt32(&item.refCount) == 0 {
-			c.bucket(item.key).delete(item.key)
-			itemSize := item.size
-			c.size -= itemSize
-			prunedSize += itemSize
-
-			c.list.Remove(item)
-			if c.onDelete != nil {
-				c.onDelete(item)
-			}
-			dropped += 1
-			item.promotions = -2
-		}
-		item = prev
-	}
-	return dropped
 }
