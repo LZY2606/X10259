@@ -46,6 +46,7 @@ func Layered[T any](config *Configuration[T]) *LayeredCache[T] {
 	for i := 0; i < config.buckets; i++ {
 		c.buckets[i] = &layeredBucket[T]{
 			buckets: make(map[string]*bucket[T]),
+			now:     config.now,
 		}
 	}
 	go c.worker()
@@ -69,7 +70,7 @@ func (c *LayeredCache[T]) Get(primary, secondary string) *Item[T] {
 	if item == nil {
 		return nil
 	}
-	if item.expires > time.Now().UnixNano() {
+	if !item.Expired() {
 		select {
 		case c.promotables <- item:
 		default:
@@ -97,7 +98,7 @@ func (c *LayeredCache[T]) GetOrCreateSecondaryCache(primary string) *SecondaryCa
 	bkt := primaryBkt.getSecondaryBucket(primary)
 	primaryBkt.Lock()
 	if bkt == nil {
-		bkt = &bucket[T]{lookup: make(map[string]*Item[T])}
+		bkt = &bucket[T]{lookup: make(map[string]*Item[T]), now: c.now}
 		primaryBkt.buckets[primary] = bkt
 	}
 	primaryBkt.Unlock()
@@ -293,21 +294,18 @@ drain:
 }
 
 func (c *LayeredCache[T]) doDelete(item *Item[T]) {
-	if !item.inList {
-		item.promotions = -2
-	} else {
+	if item.inList {
 		c.size -= item.size
-		if c.onDelete != nil {
-			c.onDelete(item)
-		}
+		notifyDelete(c.onDelete, item)
 		c.list.Remove(item)
-		item.promotions = -2
 	}
+	item.kill()
 }
 
 func (c *LayeredCache[T]) doPromote(item *Item[T]) bool {
-	// deleted before it ever got promoted
-	if item.promotions == -2 {
+	// deleted before it ever got promoted: a late promotion must never
+	// revive a dead item
+	if item.killed() {
 		return false
 	}
 
@@ -316,6 +314,12 @@ func (c *LayeredCache[T]) doPromote(item *Item[T]) bool {
 			c.list.MoveToFront(item)
 			item.promotions = 0
 		}
+		return false
+	}
+
+	// an expired item must not be introduced into the list by a promotion
+	// that was queued before the item expired
+	if item.Expired() {
 		return false
 	}
 
@@ -344,11 +348,9 @@ func (c *LayeredCache[T]) gc() int {
 			prunedSize += itemSize
 
 			c.list.Remove(item)
-			if c.onDelete != nil {
-				c.onDelete(item)
-			}
+			notifyDelete(c.onDelete, item)
 			dropped += 1
-			item.promotions = -2
+			item.kill()
 		}
 		item = prev
 	}

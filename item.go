@@ -30,9 +30,19 @@ type Item[T any] struct {
 	next       *Item[T]
 	prev       *Item[T]
 	inList     bool
+	// state and notified belong to the item lifecycle state machine, see
+	// statemachine.go. state tracks alive/dead, notified tracks ownership
+	// of the (at most once) OnDelete callback.
+	state    int32
+	notified int32
+	// now is the clock used by Expired/TTL/Extend. It is set from the
+	// cache's configuration so that the production expiry path and any
+	// test-installed fake clock observe the same time source. A nil clock
+	// falls back to time.Now (items built directly, e.g. in tests).
+	now func() time.Time
 }
 
-func newItem[T any](key string, value T, expires int64, track bool) *Item[T] {
+func newItem[T any](key string, value T, expires int64, track bool, now func() time.Time) *Item[T] {
 	size := int64(1)
 
 	// https://github.com/golang/go/issues/49206
@@ -46,11 +56,19 @@ func newItem[T any](key string, value T, expires int64, track bool) *Item[T] {
 		promotions: 0,
 		size:       size,
 		expires:    expires,
+		now:        now,
 	}
 	if track {
 		item.refCount = 1
 	}
 	return item
+}
+
+func (i *Item[T]) nowTime() time.Time {
+	if i.now == nil {
+		return time.Now()
+	}
+	return i.now()
 }
 
 func (i *Item[T]) shouldPromote(getsPerPromote int32) bool {
@@ -76,12 +94,12 @@ func (i *Item[T]) Release() {
 
 func (i *Item[T]) Expired() bool {
 	expires := atomic.LoadInt64(&i.expires)
-	return expires < time.Now().UnixNano()
+	return expires < i.nowTime().UnixNano()
 }
 
 func (i *Item[T]) TTL() time.Duration {
 	expires := atomic.LoadInt64(&i.expires)
-	return time.Nanosecond * time.Duration(expires-time.Now().UnixNano())
+	return time.Nanosecond * time.Duration(expires-i.nowTime().UnixNano())
 }
 
 func (i *Item[T]) Expires() time.Time {
@@ -90,7 +108,7 @@ func (i *Item[T]) Expires() time.Time {
 }
 
 func (i *Item[T]) Extend(duration time.Duration) {
-	atomic.StoreInt64(&i.expires, time.Now().Add(duration).UnixNano())
+	atomic.StoreInt64(&i.expires, i.nowTime().Add(duration).UnixNano())
 }
 
 // String returns a string representation of the Item. This includes the default string

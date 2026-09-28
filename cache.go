@@ -35,6 +35,7 @@ func New[T any](config *Configuration[T]) *Cache[T] {
 	for i := 0; i < config.buckets; i++ {
 		c.buckets[i] = &bucket[T]{
 			lookup: make(map[string]*Item[T]),
+			now:    config.now,
 		}
 	}
 	go c.worker()
@@ -331,21 +332,17 @@ doAllDeletes:
 }
 
 func (c *Cache[T]) doDelete(item *Item[T]) {
-	if !item.inList {
-		item.promotions = -2
-	} else {
+	if item.inList {
 		c.size -= item.size
-		if c.onDelete != nil {
-			c.onDelete(item)
-		}
+		notifyDelete(c.onDelete, item)
 		c.list.Remove(item)
-		item.promotions = -2
 	}
+	item.kill()
 }
 
 func (c *Cache[T]) doPromote(item *Item[T]) bool {
-	// already deleted
-	if item.promotions == -2 {
+	// already deleted: a late promotion must never revive a dead item
+	if item.killed() {
 		return false
 	}
 
@@ -354,6 +351,12 @@ func (c *Cache[T]) doPromote(item *Item[T]) bool {
 			c.list.MoveToFront(item)
 			item.promotions = 0
 		}
+		return false
+	}
+
+	// an expired item must not be introduced into the list by a promotion
+	// that was queued before the item expired
+	if item.Expired() {
 		return false
 	}
 
@@ -381,11 +384,9 @@ func (c *Cache[T]) gc() int {
 			prunedSize += itemSize
 
 			c.list.Remove(item)
-			if c.onDelete != nil {
-				c.onDelete(item)
-			}
+			notifyDelete(c.onDelete, item)
 			dropped += 1
-			item.promotions = -2
+			item.kill()
 		}
 		item = prev
 	}

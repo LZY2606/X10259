@@ -1,5 +1,7 @@
 package ccache
 
+import "time"
+
 type Configuration[T any] struct {
 	maxSize        int64
 	buckets        int
@@ -9,6 +11,12 @@ type Configuration[T any] struct {
 	getsPerPromote int32
 	tracking       bool
 	onDelete       func(item *Item[T])
+	// now is the clock backing the production expiry path: bucket.set*
+	// stamps items with now()+duration and Item.Expired/TTL/Extend read
+	// the same clock. It is unexported so that in-package tests can install
+	// a fake clock without widening the public API; production code always
+	// uses time.Now and shares the exact same code path.
+	now func() time.Time
 }
 
 // Creates a configuration object with sensible defaults
@@ -23,6 +31,7 @@ func Configure[T any]() *Configuration[T] {
 		promoteBuffer:  1024,
 		maxSize:        5000,
 		tracking:       false,
+		now:            time.Now,
 	}
 }
 
