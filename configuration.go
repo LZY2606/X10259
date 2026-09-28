@@ -9,6 +9,14 @@ type Configuration[T any] struct {
 	getsPerPromote int32
 	tracking       bool
 	onDelete       func(item *Item[T])
+	// clock is nil in production; tests set it through the unexported
+	// withClock seam so that expiration logic exercises the same code as the
+	// real clock.
+	clock clock
+	// scheduler is nil in production. When set, the background worker asks
+	// the scheduler which queued event it is allowed to process next. It is a
+	// pure ordering seam: it does not contain any state-transition logic.
+	scheduler workerScheduler
 }
 
 // Creates a configuration object with sensible defaults
