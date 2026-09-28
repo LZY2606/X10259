@@ -22,6 +22,7 @@ type TrackedItem[T any] interface {
 type Item[T any] struct {
 	key        string
 	group      string
+	state      uint32
 	promotions int32
 	refCount   int32
 	expires    int64
@@ -43,6 +44,7 @@ func newItem[T any](key string, value T, expires int64, track bool) *Item[T] {
 	item := &Item[T]{
 		key:        key,
 		value:      value,
+		state:      uint32(statePending),
 		promotions: 0,
 		size:       size,
 		expires:    expires,
@@ -51,6 +53,18 @@ func newItem[T any](key string, value T, expires int64, track bool) *Item[T] {
 		item.refCount = 1
 	}
 	return item
+}
+
+// isFresh is the internal counterpart of Expired(). The worker uses it to
+// decide whether a queued promotion is still meaningful: an expired item must
+// not be admitted to, or reordered within, the recency list by a promotion
+// that arrives after its deadline. A nil clock means wall-clock time, so the
+// production path and the fake-clock test path run the exact same check.
+func (i *Item[T]) isFresh(now func() time.Time) bool {
+	if now == nil {
+		now = time.Now
+	}
+	return atomic.LoadInt64(&i.expires) >= now().UnixNano()
 }
 
 func (i *Item[T]) shouldPromote(getsPerPromote int32) bool {

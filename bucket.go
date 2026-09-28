@@ -9,6 +9,41 @@ import (
 type bucket[T any] struct {
 	sync.RWMutex
 	lookup map[string]*Item[T]
+	// now is the clock used to stamp newly inserted items. It is nil on the
+	// production path (wall clock) and overridden only from tests, which means
+	// the same insertion/expiry code runs in both cases.
+	now func() time.Time
+}
+
+func (b *bucket[T]) currentTime() time.Time {
+	if b.now == nil {
+		return time.Now()
+	}
+	return b.now()
+}
+
+// current reports whether item is the value currently keyed in the bucket.
+// The worker uses it to reject a promotion or an eviction that lost the race
+// against an overwrite: an item must never manipulate bucket/list state through
+// a slot that a newer item already owns.
+func (b *bucket[T]) current(key string, item *Item[T]) bool {
+	b.RLock()
+	defer b.RUnlock()
+	return b.lookup[key] == item
+}
+
+// deleteCurrent deletes the key only if it still maps to item. The return
+// value reports whether item owned the slot; when false the caller must leave
+// the list alone because some other item (an overwrite or a concurrent delete)
+// already resolved the slot.
+func (b *bucket[T]) deleteCurrent(key string, item *Item[T]) bool {
+	b.Lock()
+	defer b.Unlock()
+	if b.lookup[key] != item {
+		return false
+	}
+	delete(b.lookup, key)
+	return true
 }
 
 func (b *bucket[T]) itemCount() int {
@@ -43,7 +78,7 @@ func (b *bucket[T]) setnx(key string, value T, duration time.Duration, track boo
 		return item
 	}
 
-	expires := time.Now().Add(duration).UnixNano()
+	expires := b.currentTime().Add(duration).UnixNano()
 	newItem := newItem(key, value, expires, track)
 
 	b.Lock()
@@ -76,7 +111,7 @@ func (b *bucket[T]) setnx2(key string, f func() T, duration time.Duration, track
 		return item, true
 	}
 
-	expires := time.Now().Add(duration).UnixNano()
+	expires := b.currentTime().Add(duration).UnixNano()
 	newItem := newItem(key, f(), expires, track)
 
 	b.lookup[key] = newItem
@@ -84,7 +119,7 @@ func (b *bucket[T]) setnx2(key string, f func() T, duration time.Duration, track
 }
 
 func (b *bucket[T]) set(key string, value T, duration time.Duration, track bool) (*Item[T], *Item[T]) {
-	expires := time.Now().Add(duration).UnixNano()
+	expires := b.currentTime().Add(duration).UnixNano()
 	item := newItem(key, value, expires, track)
 	b.Lock()
 	existing := b.lookup[key]
