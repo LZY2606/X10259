@@ -24,6 +24,7 @@ type Item[T any] struct {
 	group      string
 	promotions int32
 	refCount   int32
+	state      int32
 	expires    int64
 	size       int64
 	value      T
@@ -31,6 +32,20 @@ type Item[T any] struct {
 	prev       *Item[T]
 	inList     bool
 }
+
+// Ownership state. This is the single state machine that tracks where an
+// item's lifetime is owned: the bucket lookup, the promotables queue and the
+// recency/delete machinery all coordinate exclusively through these states.
+const (
+	// stateQueued: the item exists in a bucket lookup but has never been
+	// admitted into the recency list by the worker.
+	stateQueued int32 = 0
+	// stateLive: the item is owned by the recency list (promoted).
+	stateLive int32 = 1
+	// stateDeleted: terminal state, the onDelete callback (if any) has either
+	// already fired or will never fire for this item.
+	stateDeleted int32 = 2
+)
 
 func newItem[T any](key string, value T, expires int64, track bool) *Item[T] {
 	size := int64(1)
@@ -51,6 +66,34 @@ func newItem[T any](key string, value T, expires int64, track bool) *Item[T] {
 		item.refCount = 1
 	}
 	return item
+}
+
+// claimDelete transitions the item to the terminal deleted state. It returns
+// true exactly once, for the single owner that is responsible for firing the
+// onDelete callback and freeing the item's size from the recency list. All
+// mutators run on the worker goroutine, but atomic CAS keeps the ownership
+// decision safe under -race and makes the transition self-documenting.
+func (i *Item[T]) claimDelete() bool {
+	return atomic.CompareAndSwapInt32(&i.state, stateLive, stateDeleted)
+}
+
+func (i *Item[T]) markDeleted() {
+	atomic.StoreInt32(&i.state, stateDeleted)
+}
+
+func (i *Item[T]) isDeleted() bool {
+	return atomic.LoadInt32(&i.state) == stateDeleted
+}
+
+func (i *Item[T]) isLive() bool {
+	return atomic.LoadInt32(&i.state) == stateLive
+}
+
+// claimPromote transitions a queued item into the live state. It is a no-op if
+// the item was deleted before its promotion was processed, or if it was
+// promoted concurrently by another path.
+func (i *Item[T]) claimPromote() bool {
+	return atomic.CompareAndSwapInt32(&i.state, stateQueued, stateLive)
 }
 
 func (i *Item[T]) shouldPromote(getsPerPromote int32) bool {

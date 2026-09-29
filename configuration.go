@@ -1,5 +1,7 @@
 package ccache
 
+import "time"
+
 type Configuration[T any] struct {
 	maxSize        int64
 	buckets        int
@@ -9,6 +11,8 @@ type Configuration[T any] struct {
 	getsPerPromote int32
 	tracking       bool
 	onDelete       func(item *Item[T])
+	singleflight   bool
+	clock          func() time.Time
 }
 
 // Creates a configuration object with sensible defaults
@@ -23,6 +27,7 @@ func Configure[T any]() *Configuration[T] {
 		promoteBuffer:  1024,
 		maxSize:        5000,
 		tracking:       false,
+		clock:          time.Now,
 	}
 }
 
@@ -102,5 +107,33 @@ func (c *Configuration[T]) Track() *Configuration[T] {
 // cached object that require some kind of tear-down.
 func (c *Configuration[T]) OnDelete(callback func(item *Item[T])) *Configuration[T] {
 	c.onDelete = callback
+	return c
+}
+
+// SingleFetch turns Fetch into a single-flight operation: while a fetch for a
+// missing key is in progress, concurrent Fetches for the same key join the
+// in-flight call instead of each invoking their fetch function. A fetch error
+// is shared by every waiter and leaves no cached or temporary state behind.
+// By default Fetch preserves its historical "every caller fetches" behavior.
+func (c *Configuration[T]) SingleFetch() *Configuration[T] {
+	c.singleflight = true
+	return c
+}
+
+// now returns the cache's time source. Production configurations always use
+// time.Now; the indirection lets deterministic tests inject a controllable
+// clock without adding any test-only branch to the state transitions.
+func (c *Configuration[T]) now() func() time.Time {
+	if c.clock == nil {
+		return time.Now
+	}
+	return c.clock
+}
+
+// withClock replaces the time source. It is intentionally unexported: the fake
+// clock drives the exact same expiration code path (now().Add / item expiry
+// comparisons) that production uses, it does not fork it.
+func (c *Configuration[T]) withClock(clock func() time.Time) *Configuration[T] {
+	c.clock = clock
 	return c
 }
